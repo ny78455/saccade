@@ -1,6 +1,6 @@
 import torch
 from PIL import Image
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 
 MID = "apple/FastVLM-0.5B"
 IMAGE_TOKEN_INDEX = -200  # what the model code looks for
