@@ -189,8 +189,25 @@ class FeatureAggregator:
         # Do NOT substitute a black frame — that conflates "missing" with "confirmed zero."
         real_image_packets = [p for p in packets if p.image is not None]
 
-        scene_labels = [label_scene(p.image) for p in real_image_packets]
-        scene_label = _majority_vote(scene_labels) if scene_labels else "unknown"
+        # Scene content rarely changes meaningfully within a single second —
+        # label ONE representative frame per second, not every raw frame in the
+        # window.  Using the middle frame avoids first/last-frame edge artefacts.
+        #
+        # DECISIONS.md §18 — call-frequency fix:
+        #   Before this change, label_scene() was called once per raw FramePacket
+        #   (N calls/second at 5–10 fps).  With the gemma4 backend, each call
+        #   triggers a full generative forward pass, inflating call volume by up to
+        #   10× per second.  Majority-voting N generative calls for the same second
+        #   is pure waste; a single deterministic label is all the aggregator needs.
+        if real_image_packets:
+            _rep_packet = real_image_packets[len(real_image_packets) // 2]
+            scene_label = (
+                label_scene(_rep_packet.image)
+                if _rep_packet.image is not None
+                else "unknown"
+            )
+        else:
+            scene_label = "unknown"
 
         action_labels = [label_action(p.motion_score) for p in packets]
         action_label = _majority_vote(action_labels)
