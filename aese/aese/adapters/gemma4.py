@@ -28,13 +28,19 @@ from __future__ import annotations
 import logging
 import re
 import threading
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 _MODEL_ID = "google/gemma-4-E2B-it"
+
+# Fix 3 — maximum image dimension before feeding to the vision tower.
+# Gemma-4's image encoder works well at 512px; larger inputs increase patch
+# token count (and therefore prefill compute) with no meaningful quality gain
+# for typical movie-frame content.  Tune if downstream quality degrades.
+_MAX_DIM = 512
 
 # Module-level singletons
 _model = None
@@ -65,17 +71,50 @@ def _ensure_loaded() -> bool:
             import torch
             from transformers import AutoProcessor, AutoModelForMultimodalLM
 
-            dtype = "auto"
+            # Fix 4 — explicit dtype instead of "auto": bfloat16 on GPU (faster
+            # than fp16, native on Ampere+), float32 on CPU.
+            gpu_available = torch.cuda.is_available()
+            dtype = torch.bfloat16 if gpu_available else torch.float32
+
+            if not gpu_available:
+                logger.warning(
+                    "AESE Gemma-4: no CUDA GPU detected — running a 2B multimodal "
+                    "model on CPU will be significantly slower than GPU regardless "
+                    "of efficiency fixes applied here. Consider passing "
+                    "'--vlm fastvlm' (apple/FastVLM-0.5B) as a CPU-friendly "
+                    "alternative if real-time or near-real-time performance is needed."
+                )
+
+            # Fix 4 — explicit attention implementation: SDPA is widely supported
+            # (PyTorch ≥ 2.0) and meaningfully faster than eager attention.
+            # Flash-Attention-2 is even faster but requires a separate install.
+            # Fall back gracefully if the installed transformers version does not
+            # accept attn_implementation (pre-4.36 builds).
+            attn_impl = "sdpa"
             logger.info(
-                "AESE Gemma-4: loading %s (dtype=%s, device_map=auto) ...",
-                _MODEL_ID, dtype,
+                "AESE Gemma-4: loading %s (dtype=%s, attn=%s, device_map=auto) ...",
+                _MODEL_ID, dtype, attn_impl,
             )
             _processor = AutoProcessor.from_pretrained(_MODEL_ID)
-            _model = AutoModelForMultimodalLM.from_pretrained(
-                _MODEL_ID,
-                dtype=dtype,
-                device_map="auto",
-            )
+            try:
+                _model = AutoModelForMultimodalLM.from_pretrained(
+                    _MODEL_ID,
+                    torch_dtype=dtype,
+                    device_map="auto",
+                    attn_implementation=attn_impl,
+                )
+            except TypeError:
+                # Older transformers versions don't accept attn_implementation.
+                logger.warning(
+                    "AESE Gemma-4: attn_implementation='sdpa' not accepted by "
+                    "this transformers version — falling back to eager attention. "
+                    "Upgrade to transformers>=4.36 for SDPA support."
+                )
+                _model = AutoModelForMultimodalLM.from_pretrained(
+                    _MODEL_ID,
+                    torch_dtype=dtype,
+                    device_map="auto",
+                )
             _model.eval()
             _gemma4_available = True
             logger.info("AESE Gemma-4: model loaded successfully.")
@@ -139,7 +178,7 @@ def _ask(
             messages.append({"role": "system", "content": [{"type": "text", "text": system_prompt}]})
 
         if image_rgb is not None:
-            pil_img = PILImage.fromarray(image_rgb)
+            pil_img = _prepare_image(image_rgb)  # Fix 3: downscale before encoding
             messages.append(
                 {
                     "role": "user",
@@ -191,6 +230,36 @@ def _ask(
     except Exception as exc:
         logger.debug("AESE Gemma-4: inference error: %s", exc)
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 — image preparation (downscale to <= _MAX_DIM before vision-tower encoding)
+# ---------------------------------------------------------------------------
+
+def _prepare_image(image_rgb: np.ndarray) -> "PILImage.Image":  # type: ignore[name-defined]
+    """
+    Convert an RGB numpy array to a PIL Image, downscaling so the longest
+    dimension is at most _MAX_DIM pixels.
+
+    Vision-language models internally tile/patch high-resolution images;
+    feeding a 1080p frame directly increases the number of image tokens (and
+    therefore prefill compute) without improving caption quality once the
+    resolution exceeds the model's effective working resolution (~512px for
+    Gemma-4-E2B).  Aspect ratio is preserved; LANCZOS filter minimises
+    aliasing on edges.
+
+    DECISIONS.md §18 — quality sign-off required before production:
+        Run a manual comparison on 5 representative keyframes at original vs
+        512px resolution and record results in DECISIONS.md §18 before shipping.
+    """
+    import PIL.Image as PILImage
+    pil_img = PILImage.fromarray(image_rgb)
+    if max(pil_img.size) > _MAX_DIM:
+        scale = _MAX_DIM / max(pil_img.size)
+        new_w = max(1, int(pil_img.width * scale))
+        new_h = max(1, int(pil_img.height * scale))
+        pil_img = pil_img.resize((new_w, new_h), PILImage.LANCZOS)
+    return pil_img
 
 
 # ---------------------------------------------------------------------------
@@ -257,3 +326,78 @@ def caption_event(
         f"Be specific about actions and setting. Reply with one sentence only."
     )
     return _ask(image, prompt, max_new_tokens=100)
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — merged scene-label + caption in a single forward pass
+# ---------------------------------------------------------------------------
+
+def _parse_scene_and_caption(
+    raw: str,
+    fallback_labels: List[str],
+) -> Tuple[str, str]:
+    """
+    Parse a combined SCENE/CAPTION response produced by describe_scene_and_caption().
+
+    Expected format (case-insensitive, both fields present):
+        SCENE: <label>
+        CAPTION: <one sentence>
+
+    Returns:
+        (scene_label, caption): both are strings; scene_label falls back to
+        "unknown" if not in fallback_labels or missing; caption falls back to ""
+        if missing.  Never raises.
+    """
+    scene_match = re.search(r"SCENE:\s*(.+)", raw, re.IGNORECASE)
+    caption_match = re.search(r"CAPTION:\s*(.+)", raw, re.IGNORECASE)
+
+    raw_scene = scene_match.group(1).strip().strip('"').strip("'") if scene_match else ""
+    scene = raw_scene if raw_scene in fallback_labels else "unknown"
+
+    caption = caption_match.group(1).strip() if caption_match else ""
+    return scene, caption
+
+
+def describe_scene_and_caption(
+    image: np.ndarray,
+    action_label: str,
+    dialogue_text: Optional[str],
+    scene_labels: Optional[List[str]] = None,
+) -> Tuple[str, str]:
+    """
+    Single Gemma-4 generation call that produces BOTH the scene label AND the
+    event caption, avoiding a second full image-encoding pass for the same frame.
+
+    This halves the number of vision-tower forward passes per event compared to
+    calling describe_scene() + caption_event() separately.
+
+    Args:
+        image:        HxWx3 RGB numpy array (the representative keyframe).
+        action_label: Coarse action bucket ("static" / "walking" / "fast_action").
+        dialogue_text: Optional subtitle text (truncated to 80 chars in the prompt).
+        scene_labels: Label vocabulary to constrain the SCENE field.  Defaults to
+                      SCENE_LABELS from scene_label.py.
+
+    Returns:
+        (scene_label, caption) — both strings.  scene_label is one of scene_labels
+        or "unknown"; caption is the generated sentence or "" on failure.
+        Never raises; falls back to ("unknown", "") on any error.
+    """
+    from .scene_label import SCENE_LABELS
+    labels = scene_labels if scene_labels is not None else SCENE_LABELS
+    label_list = ", ".join(f'"{l}"' for l in labels if l != "unknown")
+    dialogue_part = (
+        f' Dialogue spoken: "{dialogue_text[:80]}{"..." if len(dialogue_text) > 80 else ""}"'
+        if dialogue_text
+        else ""
+    )
+    prompt = (
+        f"Look at this image and respond in EXACTLY this format (two lines, no extras):\n"
+        f"SCENE: <one label from: {label_list}>\n"
+        f"CAPTION: <one concise sentence describing the action and setting>\n"
+        f"Context — action: {action_label}.{dialogue_part}"
+    )
+    raw = _ask(image, prompt, max_new_tokens=120)
+    if not raw:
+        return "unknown", ""
+    return _parse_scene_and_caption(raw, fallback_labels=labels)
