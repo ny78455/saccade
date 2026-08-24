@@ -340,3 +340,104 @@ It is never deprecated, never optional, always called first to produce the fallb
   - `test_regression_fight_clip.py::test_generative_summary_call_count_matches_event_count`
   - `test_performance_gates.py::test_per_second_decision_latency` (p95 < 100ms)
   - `test_performance_gates.py::test_full_pipeline_runtime_budget` (< 90s for 81s clip)
+
+---
+
+## 18. GEMMA-4 INFERENCE EFFICIENCY — Call-Frequency Fix + Per-Call Optimisations
+
+**Date:** 2026-08-24
+
+---
+
+### Fix 18.1 — Scene label called once per second, not once per raw frame (`aggregator.py`)
+
+**Root cause (confirmed bug, line 192 before fix):**
+```python
+# BEFORE — per-packet list comprehension: N VLM calls/second at N fps
+scene_labels = [label_scene(p.image) for p in real_image_packets]
+scene_label = _majority_vote(scene_labels) if scene_labels else "unknown"
+```
+During 5–10 fps action segments, `real_image_packets` contained 5–10 elements.
+With the `gemma4` backend active, each `label_scene()` call triggers a full
+generative forward pass.  This inflated call volume by up to 10× per second.
+
+**Fix:** Select the middle packet as the representative frame and call
+`label_scene()` exactly once:
+```python
+# AFTER — exactly 1 VLM call per second
+_rep_packet = real_image_packets[len(real_image_packets) // 2]
+scene_label = label_scene(_rep_packet.image) if _rep_packet.image is not None else "unknown"
+```
+**Quality tradeoff:** None.  Scene content does not change meaningfully within a
+single one-second window.  Majority-voting N generative calls that all see the
+same scene is pure redundancy.
+
+**Regression test:** `tests/test_gemma4_speed_regression.py::test_scene_label_called_once_per_second_not_per_frame`
+
+---
+
+### Fix 18.2 — Merged scene-label + caption call (`gemma4.py`)
+
+`describe_scene_and_caption()` encodes the image through the vision tower once
+and extracts both the scene label and the event caption in a single generation
+call, using a structured `SCENE: / CAPTION:` output format.  This halves the
+image-encoding cost per event compared to calling `describe_scene()` +
+`caption_event()` separately.
+
+`vlm_router.describe_scene_and_caption()` routes to the native combined path
+on `gemma4` and falls back to two sequential calls on `fastvlm` / `yunet`,
+preserving the identical `(str, str)` return type for all callers.
+
+**Regression tests:**
+- `test_combined_scene_and_caption_parses_correctly` — happy-path parse
+- `test_combined_scene_and_caption_malformed_falls_back` — missing fields degrade to `("unknown", "")` without raising
+- `test_combined_scene_label_not_in_vocabulary_falls_back_to_unknown` — hallucinated labels rejected
+
+---
+
+### Fix 18.3 — Keyframe downscaling before inference (`gemma4.py::_prepare_image`)
+
+**Decision:** Keyframes are resized to a maximum longest dimension of 512px
+(`_MAX_DIM = 512`) using LANCZOS resampling before being passed to the Gemma-4
+vision tower.
+
+**Rationale:** Vision-language models internally tile or patch high-resolution
+inputs.  A 1920×1080 frame produces ~4× more image tokens than a 512×288 frame.
+Beyond the model's effective working resolution, additional pixels increase
+prefill compute without improving caption quality on typical movie-frame content.
+512px is Gemma-4-E2B's documented recommended input size.
+
+**REQUIRED BEFORE PRODUCTION — quality sign-off:**
+Run a side-by-side caption comparison on at least 5 representative keyframes
+(one each from dialogue, action, transition, close-up, and low-light scenes)
+at original resolution vs 512px.  Record results here before enabling this
+setting in a production pipeline.  If any meaningful quality regression is
+observed, increase `_MAX_DIM` or add a per-backend override.
+
+**Regression tests:** `test_prepare_image_downscales_large_frame`,
+`test_prepare_image_preserves_aspect_ratio`, `test_prepare_image_leaves_small_frame_unchanged`
+
+---
+
+### Fix 18.4 — Explicit dtype and attention implementation (`gemma4.py::_ensure_loaded`)
+
+**dtype:** Replaced `dtype="auto"` with explicit `torch.bfloat16` (CUDA) /
+`torch.float32` (CPU).  `bfloat16` is native on Ampere and newer GPUs, avoids
+`fp16` overflow risk on activations, and removes the ambiguity of `"auto"`.
+
+**Attention implementation:** Set `attn_implementation="sdpa"` (PyTorch Scaled
+Dot-Product Attention, available since PyTorch 2.0).  SDPA fuses QKV
+projections and is meaningfully faster than eager attention on modern hardware.
+Falls back to `"eager"` with a logged warning if the installed `transformers`
+version predates `attn_implementation` support (pre-4.36).
+
+**CPU-only honesty note:** If `torch.cuda.is_available()` returns `False`, AESE
+logs a WARNING at startup:
+> "Running a 2B multimodal model on CPU will be significantly slower than GPU
+> regardless of efficiency fixes.  Consider `--vlm fastvlm` as a CPU-friendly
+> alternative."
+These inference-efficiency fixes (dtype, SDPA, downscaling) reduce per-call
+overhead but cannot overcome the fundamental throughput gap between CPU and GPU
+for a 2B-parameter multimodal model.  Do not interpret these fixes as a promise
+of CPU parity.
+
