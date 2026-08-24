@@ -155,6 +155,59 @@ def caption_event(
         return ""
 
 
+def describe_scene_and_caption(
+    image: np.ndarray,
+    action_label: str,
+    dialogue_text: Optional[str],
+    scene_labels: Optional[list] = None,
+) -> tuple:
+    """
+    Combined scene-label + event-caption in a single VLM call.
+
+    When the active backend is ``gemma4``, this routes to
+    ``gemma4.describe_scene_and_caption()`` which encodes the image through
+    the vision tower exactly once, halving image-encoding cost vs two separate
+    calls.
+
+    For backends that don't support the combined call (fastvlm, yunet), this
+    falls back to calling describe_scene() + caption_event() individually and
+    assembles the tuple — the API contract is identical for callers.
+
+    Returns:
+        (scene_label: str, caption: str) — never raises; falls back to
+        ("unknown", "") on any error.
+    """
+    mod = _adapter()
+    if mod is None:
+        return ("unknown", "")
+
+    # Gemma-4 native combined path
+    if _backend == "gemma4" and hasattr(mod, "describe_scene_and_caption"):
+        try:
+            return mod.describe_scene_and_caption(
+                image, action_label, dialogue_text, scene_labels
+            )
+        except Exception as exc:
+            logger.debug(
+                "AESE VLM router: describe_scene_and_caption error (%s): %s",
+                _backend, exc,
+            )
+            return ("unknown", "")
+
+    # Fallback: two separate calls for backends that don't support combined
+    try:
+        scene = mod.describe_scene(image)
+    except Exception as exc:
+        logger.debug("AESE VLM router: describe_scene error (%s): %s", _backend, exc)
+        scene = "unknown"
+    try:
+        caption = mod.caption_event(image, scene, action_label, dialogue_text)
+    except Exception as exc:
+        logger.debug("AESE VLM router: caption_event error (%s): %s", _backend, exc)
+        caption = ""
+    return (scene, caption)
+
+
 def ask(
     image_rgb: Optional[np.ndarray],
     prompt: str,
