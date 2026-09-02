@@ -32,6 +32,8 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+from ._dtype_utils import _select_dtype  # shared fp16/fp32 selection logic
+
 logger = logging.getLogger(__name__)
 
 _MODEL_ID = "google/gemma-4-E2B-it"
@@ -71,12 +73,14 @@ def _ensure_loaded() -> bool:
             import torch
             from transformers import AutoProcessor, AutoModelForMultimodalLM
 
-            # Fix 4 — explicit dtype instead of "auto": bfloat16 on GPU (faster
-            # than fp16, native on Ampere+), float32 on CPU.
-            gpu_available = torch.cuda.is_available()
-            dtype = torch.bfloat16 if gpu_available else torch.float32
+            # §19 — explicit dtype via shared _select_dtype():
+            #   float16 on CUDA (GPU fp16 is well-optimised; ~1.5-2x over fp32)
+            #   float32 on CPU/MPS (CPU fp16 kernels are poorly optimised or absent)
+            # Previously used bfloat16 (§18.4); changed to float16 per contract §19.
+            # See DECISIONS.md §19 for the bfloat16 vs float16 tradeoff rationale.
+            dtype = _select_dtype()
 
-            if not gpu_available:
+            if not torch.cuda.is_available():
                 logger.warning(
                     "AESE Gemma-4: no CUDA GPU detected — running a 2B multimodal "
                     "model on CPU will be significantly slower than GPU regardless "
@@ -85,7 +89,7 @@ def _ensure_loaded() -> bool:
                     "alternative if real-time or near-real-time performance is needed."
                 )
 
-            # Fix 4 — explicit attention implementation: SDPA is widely supported
+            # §18.4 — explicit attention implementation: SDPA is widely supported
             # (PyTorch ≥ 2.0) and meaningfully faster than eager attention.
             # Flash-Attention-2 is even faster but requires a separate install.
             # Fall back gracefully if the installed transformers version does not
@@ -117,7 +121,7 @@ def _ensure_loaded() -> bool:
                 )
             _model.eval()
             _gemma4_available = True
-            logger.info("AESE Gemma-4: model loaded successfully.")
+            logger.info("AESE Gemma-4: model loaded successfully (dtype=%s).", dtype)
         except ImportError as exc:
             logger.warning(
                 "AESE Gemma-4: load failed (missing dependency: %s). "
@@ -224,6 +228,19 @@ def _ask(
                 raw = _processor.parse_response(raw) or raw
             except Exception:
                 pass  # parse_response is optional; raw string is fine
+
+        # §19 — fp16 degenerate-output guard: fp16's reduced exponent range can
+        # occasionally produce NaN/inf in logits, which decodes to empty or
+        # single-character garbage.  Treat that identically to any other VLM
+        # failure: return "" so the caller's existing template-summary fallback
+        # engages.  No new failure mode; no special-casing needed elsewhere.
+        if not raw or len(raw) < 2:
+            logger.debug(
+                "AESE Gemma-4: suspiciously short/empty output (len=%d) — "
+                "possible fp16 degenerate decode; treating as failure.",
+                len(raw),
+            )
+            return ""
 
         return raw
 
