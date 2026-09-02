@@ -16,10 +16,15 @@ Fix 3 (gemma4.py::_prepare_image):
     _prepare_image() downscales images with longest dimension > 512px; leaves
     images that are already small untouched.
 
+Fix 4 (gemma4.py, _dtype_utils.py §19):
+    _select_dtype() returns torch.float16 on CUDA and torch.float32 on CPU.
+    _ask() degenerate-output guard returns "" for empty/single-char fp16 output.
+
 These tests use only mocks and numpy — no model weights or GPU required.
 
 History:
     2026-08-24: Initial version (Gemma-4 call-frequency + efficiency fixes).
+    2026-09-02: Fix 4 — _select_dtype() + degenerate-output guard tests (§19).
 """
 from __future__ import annotations
 
@@ -291,4 +296,172 @@ def test_prepare_image_exact_boundary_unchanged():
     pil = _prepare_image(img)
     assert pil.size == (_MAX_DIM // 2, _MAX_DIM), (
         f"Image at exactly _MAX_DIM should be unchanged, got {pil.size}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 4 — _select_dtype(): float16 on CUDA, float32 on CPU (DECISIONS.md §19)
+# ---------------------------------------------------------------------------
+
+def test_select_dtype_returns_float16_on_cuda():
+    """
+    When CUDA is available, _select_dtype() must return torch.float16.
+    Contract §19 — GPU users get fp16 for the ~1.5-2x bandwidth reduction.
+    """
+    import torch
+    from aese.adapters._dtype_utils import _select_dtype
+
+    with patch("torch.cuda.is_available", return_value=True):
+        dtype = _select_dtype()
+
+    assert dtype == torch.float16, (
+        f"Expected torch.float16 on CUDA, got {dtype}. "
+        f"_select_dtype() must return float16 when CUDA is available."
+    )
+
+
+def test_select_dtype_returns_float32_on_cpu():
+    """
+    When CUDA is NOT available, _select_dtype() must return torch.float32.
+    Contract §19 — CPU fp16 kernels are poorly optimised; float32 is the safe
+    choice that avoids paying conversion overhead for no speed benefit.
+    """
+    import torch
+    from aese.adapters._dtype_utils import _select_dtype
+
+    with patch("torch.cuda.is_available", return_value=False):
+        dtype = _select_dtype()
+
+    assert dtype == torch.float32, (
+        f"Expected torch.float32 on CPU, got {dtype}. "
+        f"Do NOT force float16 on CPU — it is slower on most backends."
+    )
+
+
+def test_select_dtype_not_float16_on_cpu():
+    """
+    Explicit negative: when CUDA is unavailable the result must not be float16.
+    This is the single most common way this kind of change makes things *slower*
+    rather than faster — guard against regressions here.
+    """
+    import torch
+    from aese.adapters._dtype_utils import _select_dtype
+
+    with patch("torch.cuda.is_available", return_value=False):
+        dtype = _select_dtype()
+
+    assert dtype != torch.float16, (
+        f"_select_dtype() returned float16 on CPU — this is wrong. "
+        f"float16 CPU inference pays conversion cost with no speed benefit."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 4 — degenerate-output guard in _ask() (DECISIONS.md §19)
+# ---------------------------------------------------------------------------
+
+def _make_mock_model_and_processor(decoded_output: str):
+    """
+    Build minimal mocks for _model and _processor that simulate a Gemma-4
+    inference call producing `decoded_output` when decoded.
+
+    Returns (mock_model, mock_processor, mock_inputs).
+    """
+    import torch
+
+    mock_model = MagicMock()
+    mock_model.device = "cpu"
+    # generate() returns a (1, N) tensor; the slice [0][input_len:] is decoded
+    fake_output = torch.zeros((1, 5), dtype=torch.long)
+    mock_model.generate.return_value = fake_output
+
+    mock_processor = MagicMock()
+    # apply_chat_template returns a dict-like with input_ids of shape (1, 3)
+    mock_inputs = {
+        "input_ids": torch.zeros((1, 3), dtype=torch.long),
+    }
+    mock_processor.apply_chat_template.return_value = mock_inputs
+    # decode() returns whatever we want to test
+    mock_processor.decode.return_value = decoded_output
+    # No parse_response method — keeps test simple
+    del mock_processor.parse_response
+
+    return mock_model, mock_processor, mock_inputs
+
+
+def test_ask_degenerate_empty_output_returns_empty_string():
+    """
+    When model.generate() decodes to an empty string (fp16 NaN/inf degenerate
+    case), _ask() must return "" rather than passing the garbage through.
+    The caller's existing template-summary fallback handles "" already.
+    """
+    import aese.adapters.gemma4 as gemma4_mod
+
+    mock_model, mock_processor, _ = _make_mock_model_and_processor("")
+
+    with (
+        patch.object(gemma4_mod, "_gemma4_available", True),
+        patch.object(gemma4_mod, "_model", mock_model),
+        patch.object(gemma4_mod, "_processor", mock_processor),
+        patch("aese.adapters.gemma4._ensure_loaded", return_value=True),
+    ):
+        result = gemma4_mod._ask(
+            image_rgb=np.zeros((64, 64, 3), dtype=np.uint8),
+            prompt="Describe this scene.",
+        )
+
+    assert result == "", (
+        f"Expected '' for empty decode (fp16 degenerate), got {result!r}. "
+        f"The degenerate-output guard must return '' to engage the template fallback."
+    )
+
+
+def test_ask_single_char_output_returns_empty_string():
+    """
+    When model.generate() decodes to a single character (len < 2), _ask() must
+    also return "" — a one-character response is not a valid caption.
+    """
+    import aese.adapters.gemma4 as gemma4_mod
+
+    mock_model, mock_processor, _ = _make_mock_model_and_processor(".")
+
+    with (
+        patch.object(gemma4_mod, "_gemma4_available", True),
+        patch.object(gemma4_mod, "_model", mock_model),
+        patch.object(gemma4_mod, "_processor", mock_processor),
+        patch("aese.adapters.gemma4._ensure_loaded", return_value=True),
+    ):
+        result = gemma4_mod._ask(
+            image_rgb=np.zeros((64, 64, 3), dtype=np.uint8),
+            prompt="Describe this scene.",
+        )
+
+    assert result == "", (
+        f"Expected '' for single-char decode, got {result!r}. "
+        f"len < 2 must be treated as a degenerate failure."
+    )
+
+
+def test_ask_valid_output_passes_through():
+    """
+    Sanity check: a valid >=2 char response must NOT be swallowed by the guard.
+    """
+    import aese.adapters.gemma4 as gemma4_mod
+
+    valid_caption = "Two fighters exchange blows in a dimly lit warehouse."
+    mock_model, mock_processor, _ = _make_mock_model_and_processor(valid_caption)
+
+    with (
+        patch.object(gemma4_mod, "_gemma4_available", True),
+        patch.object(gemma4_mod, "_model", mock_model),
+        patch.object(gemma4_mod, "_processor", mock_processor),
+        patch("aese.adapters.gemma4._ensure_loaded", return_value=True),
+    ):
+        result = gemma4_mod._ask(
+            image_rgb=np.zeros((64, 64, 3), dtype=np.uint8),
+            prompt="Describe this scene.",
+        )
+
+    assert result == valid_caption, (
+        f"Valid output was incorrectly swallowed by the degenerate guard: {result!r}"
     )
