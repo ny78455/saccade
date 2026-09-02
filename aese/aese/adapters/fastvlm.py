@@ -14,7 +14,7 @@ All three:
     not loadable, or the image is None / black (image_available=False guard
     is applied by callers).
   - Load the model ONCE on first call (lazy, thread-safe via a module lock).
-  - Use float16 when a CUDA device is available, float32 otherwise.
+  - Use `_select_dtype()` from `_dtype_utils` (float16 on CUDA, float32 on CPU/MPS).
 
 Dependencies (added to requirements.txt):
   transformers>=4.52.0   (FastVlmForConditionalGeneration first appeared here)
@@ -28,6 +28,8 @@ import threading
 from typing import Optional
 
 import numpy as np
+
+from ._dtype_utils import _select_dtype  # shared fp16/fp32 selection logic
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +71,9 @@ def _ensure_loaded() -> bool:
             import torch
             from transformers import AutoTokenizer, AutoModelForCausalLM
 
-            dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+            # §19 — use shared _select_dtype(): float16 on CUDA, float32 on CPU/MPS.
+            # Previously inlined here; extracted to _dtype_utils for DRY sharing with gemma4.
+            dtype = _select_dtype()
             logger.info(
                 "AESE FastVLM: loading %s (dtype=%s, device_map=auto) ...",
                 _MODEL_ID, dtype,
