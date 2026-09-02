@@ -441,3 +441,103 @@ overhead but cannot overcome the fundamental throughput gap between CPU and GPU
 for a 2B-parameter multimodal model.  Do not interpret these fixes as a promise
 of CPU parity.
 
+---
+
+## 19. FP16 WEIGHT LOADING — Gemma-4 and FastVLM (AESE Contract §19)
+
+**Date:** 2026-09-02
+
+---
+
+### 19.1 — Shared `_select_dtype()` utility (`aese/adapters/_dtype_utils.py`)
+
+**Decision:** The inline `torch.float16 if torch.cuda.is_available() else torch.float32`
+expression that existed independently in `fastvlm.py` has been extracted into a shared
+`_select_dtype()` function in a new `_dtype_utils.py` module.  Both `gemma4.py` and
+`fastvlm.py` now import and call this function.
+
+**Rule:**
+- `torch.cuda.is_available()` returns `True` → `torch.float16`
+- Otherwise (CPU, MPS, no torch) → `torch.float32`
+
+**Why NOT `float16` on CPU:**
+Most CPU kernels either lack optimised fp16 implementations or internally upcast to
+fp32 anyway, paying the conversion cost for no speed benefit.  Forcing fp16 on CPU
+is the single most common way this kind of change makes things *slower*, not faster.
+Apple Silicon (MPS) has partial fp16 support but has not been verified for this model
+class — treated conservatively as fp32.
+
+**Why NOT force `bfloat16` here:**
+`bfloat16` has the same exponent range as fp32 and is therefore more stable than fp16
+on activations with large magnitudes (no overflow risk).  Gemma-4 was previously loaded
+in `bfloat16` (§18.4).  This contract explicitly requests `float16` for the measured
+GPU throughput benefit; the degenerate-output guard (§19.2) catches the rare NaN/inf
+case rather than letting it pass through silently.
+
+**Regression tests:**
+- `test_select_dtype_returns_float16_on_cuda` — mock CUDA=True → assert `torch.float16`
+- `test_select_dtype_returns_float32_on_cpu` — mock CUDA=False → assert `torch.float32`
+- `test_select_dtype_not_float16_on_cpu` — explicit negative guard
+
+---
+
+### 19.2 — Degenerate-output guard in `gemma4._ask()` (`gemma4.py`)
+
+**Defect risk:** fp16's reduced exponent range (max ~65,504 vs fp32's ~3.4×10³⁸) can
+occasionally produce `NaN`/`inf` in logits for certain inputs — particularly long
+contexts or unusual image content.  This does not crash; it silently produces an empty
+or single-character decode.
+
+**Fix:** Added a post-decode length check in `_ask()`:
+```python
+if not raw or len(raw) < 2:
+    logger.debug("AESE Gemma-4: suspiciously short/empty output ...")
+    return ""
+```
+Returning `""` routes the call through the exact same fallback path (`"" → template
+summary`) that already handles every other VLM failure — no new failure mode, no
+special-casing needed in callers.
+
+**Regression tests:**
+- `test_ask_degenerate_empty_output_returns_empty_string` — empty decode → `""`
+- `test_ask_single_char_output_returns_empty_string` — single-char decode → `""`
+- `test_ask_valid_output_passes_through` — valid caption is NOT swallowed by guard
+
+---
+
+### 19.3 — Before/after benchmark (`eval/benchmark_fp16.py`)
+
+**Required before shipping to production:**  Run `python eval/benchmark_fp16.py` on
+GPU hardware and record results here.  A precision change needs measured evidence.
+
+```
+python eval/benchmark_fp16.py --iterations 5 --output eval/benchmark_fp16_results.json
+```
+
+**Results (PLACEHOLDER — fill in after running on GPU):**
+
+| Metric | fp32 baseline | fp16 |
+|--------|--------------|------|
+| GPU | — | — |
+| Inference (5 frames) | — s | — s |
+| ms / frame | — | — |
+| Speedup | | **—x** |
+
+**Caption quality comparison (PLACEHOLDER — fill in after running):**
+
+> Record the side-by-side captions printed by the benchmark here.
+> If fp16 captions are meaningfully degraded vs fp32, revert `gemma4.py` to
+> `bfloat16` and update this section with the rationale.
+
+---
+
+### 19.4 — CPU-only honesty note
+
+If `torch.cuda.is_available()` returns `False` at runtime:
+- `_select_dtype()` returns `torch.float32` — no fp16 loading, no benefit attempted.
+- `_ensure_loaded()` logs a WARNING recommending `--vlm fastvlm` as a CPU-friendly
+  alternative (FastVLM-0.5B vs Gemma-4-E2B has ~4× fewer parameters).
+- If CPU speed is the real constraint, **int4/int8 quantization via `bitsandbytes`**
+  is the correct next step.  That is a different, larger technique with different
+  tradeoffs and is explicitly out of scope for this contract.
+
