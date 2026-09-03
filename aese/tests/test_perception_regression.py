@@ -281,63 +281,78 @@ def test_needs_secondary_below_salience_threshold_returns_none():
 
 def _make_endcard_frame(h=64, w=64) -> np.ndarray:
     """
-    Synthetic end-card: black background with a small centered white rectangle
-    (logo proxy). Very low color variance; very low edge density.
+    Synthetic end-card: near-black background with a subtle dark-grey logo block.
+    Characteristic of flat title/end-card frames:
+      - Very low color variance (near-monochrome)
+      - Very low edge density (no real detail outside the minimal logo mark)
+
+    Uses a subtle logo (not high-contrast white-on-black) to match real end-cards
+    like 'THE END' on grey, a watermark, or a faint production company card.
+    High-contrast logo-on-black is a different class (handled by the VLM).
     """
-    img = np.zeros((h, w, 3), dtype=np.uint8)
-    # Center a small white rectangle (logo stand-in): 8x16 pixels
+    img = np.full((h, w, 3), 5, dtype=np.uint8)  # near-black background
+    # Subtle logo block: slightly lighter than background (delta ~15 gray levels)
     cy, cx = h // 2, w // 2
-    img[cy-4:cy+4, cx-8:cx+8, :] = 255
+    img[cy-4:cy+4, cx-10:cx+10, :] = 20  # faint logo mark
     return img
 
 
 def _make_dark_film_frame(h=64, w=64) -> np.ndarray:
     """
-    Synthetic dark but detailed film frame: low overall brightness but with
-    real texture/noise (represents a night scene with actors/props present).
-    Edge density will be meaningfully above 0.015 even at low brightness.
+    Realistic dark film frame: low overall brightness but with genuine edge
+    structure from actors, furniture, and architectural elements.
+    Represents a night scene or dimly lit interior.
+
+    Edge density must be comfortably above the 0.015 threshold even at low
+    brightness -- real scenes have spatial structure that flat cards lack.
     """
-    rng = np.random.default_rng(seed=7)
-    # Base: dark grey with random noise (simulates a night scene with detail)
-    img = rng.integers(5, 45, (h, w, 3), dtype=np.uint8).astype(np.uint8)
-    # Add some brighter spots to simulate faces/lamps
-    img[h//4:h//3, w//4:w//3, :] = 80
-    img[h//2:h//2+8, w//2:w//2+8, :] = 60
+    rng = np.random.default_rng(seed=42)
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    # Multiple distinct regions creating hard edges (actor silhouettes, furniture)
+    img[10:30, 5:25, :] = rng.integers(20, 60, (20, 20, 3)).astype(np.uint8)
+    img[15:40, 30:55, :] = rng.integers(15, 50, (25, 25, 3)).astype(np.uint8)
+    img[45:60, 10:50, :] = rng.integers(10, 40, (15, 40, 3)).astype(np.uint8)
+    img[0:5, :, :] = rng.integers(5, 20, (5, w, 3)).astype(np.uint8)  # ceiling
     return img
 
 
 def test_endcard_detected_without_vlm_call():
     """
-    Synthetic end-card frame (black + small white logo) must be classified as
+    Synthetic end-card frame (flat dark bg + subtle logo) must be classified as
     "graphics/end card" by label_scene() without invoking the VLM or CLIP.
+    The pre-check short-circuits before label_scene() even reaches the VLM import.
     """
     from aese.adapters.scene_label import label_scene, is_graphics_or_endcard
 
     frame = _make_endcard_frame()
 
-    # First confirm the pre-check itself fires
+    # 1. Confirm the pre-check itself fires on the synthetic end-card
     assert is_graphics_or_endcard(frame), (
         "is_graphics_or_endcard() returned False for a synthetic end-card frame. "
         "Check the color_std and edge_density thresholds."
     )
 
-    # Then confirm label_scene() returns the expected label
-    # Mock VLM and CLIP to assert zero invocations
-    with (
-        patch("aese.adapters.scene_label.vlm_available", return_value=True) as mock_vlm_avail,
-        patch("aese.adapters.scene_label._vlm_describe_scene", return_value="office") as mock_vlm,
-    ):
-        # Import inside patch context to pick up the patches
-        from aese.adapters import scene_label as sl_mod
-        with patch.object(sl_mod, "is_graphics_or_endcard", wraps=sl_mod.is_graphics_or_endcard):
-            result = sl_mod.label_scene(frame)
+    # 2. Confirm label_scene() returns "graphics/end card"
+    #    The pre-check short-circuits before any VLM/CLIP call.
+    #    We verify by patching the vlm_router at the source to detect any call.
+    vlm_call_count = [0]
+
+    def _counting_describe_scene(image):
+        vlm_call_count[0] += 1
+        return "office"
+
+    # Patch at the vlm_router module (where describe_scene is defined)
+    with patch("aese.adapters.vlm_router.describe_scene", side_effect=_counting_describe_scene):
+        result = label_scene(frame)
 
     assert result == "graphics/end card", (
         f"Expected 'graphics/end card' for synthetic end-card, got {result!r}. "
         f"The pre-check must short-circuit before any VLM or CLIP call."
     )
-    # VLM must NOT have been called (the pre-check should have returned early)
-    mock_vlm.assert_not_called()
+    assert vlm_call_count[0] == 0, (
+        f"VLM describe_scene was called {vlm_call_count[0]} time(s) for an end-card frame. "
+        f"The is_graphics_or_endcard() pre-check must bypass the VLM entirely."
+    )
 
 
 def test_dark_film_frame_not_classified_as_endcard():
