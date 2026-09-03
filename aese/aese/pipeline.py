@@ -135,11 +135,9 @@ def _finalize_event(
     if event_feats and keyframe_image is not None:
         duration_s = event.duration_ms / 1000.0
         # Find primary keyframe index (match by salient peak within stored features)
-        from .keyframe import select_keyframe_salient, needs_secondary_frame as _nsf
-        import numpy as _np
         sal = [f.motion_score + f.novelty_score for f in event_feats]
-        primary_idx = int(_np.argmax(sal)) if sal else 0
-        secondary_idx = _nsf(event_feats, primary_idx, duration_s)
+        primary_idx = int(np.argmax(sal)) if sal else 0
+        secondary_idx = needs_secondary_frame(event_feats, primary_idx, duration_s)
         if secondary_idx is not None:
             sec_feat = event_feats[secondary_idx]
             secondary_frame = (
