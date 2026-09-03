@@ -237,3 +237,11 @@ real-world identity recognition.
 
 **Summaries are validated against a filler-pattern list before use.** Conversational filler
 ("Let me know if you need help", bare `---` dividers) is replaced with the template fallback.
+
+> **VLM Hallucination Warning:** Summary generation uses a small open-weight VLM
+> (FastVLM 0.5B or Gemma-4-E2B) and can occasionally hallucinate or miss salient
+> objects, especially in complex or low-light frames. This is a known limitation of
+> small generative models, not a bug that can be fully eliminated by prompting alone.
+> **It is not a substitute for human review in safety- or compliance-critical
+> applications.** See DECISIONS.md §20.4 for the anti-hallucination prompt rationale
+> and a before/after comparison log.
