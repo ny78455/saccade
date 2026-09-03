@@ -62,17 +62,15 @@ SUMMARY_SYSTEM_PROMPT = (
     "You are a factual video-event data extractor, not a conversational assistant. "
     "Given one representative frame from a video event, describe what is happening "
     "in ONE TO TWO sentences: who or what is present, the setting, the main action, "
-    "and any visible reaction from other subjects. Be specific and vivid but strictly "
-    "factual -- describe only what is visibly happening in the frame. "
-    "Do not include greetings, offers of further help, meta-commentary, or markdown. "
-    "Do not say anything except the description itself.\n\n"
-    "--- EXAMPLES ---\n\n"
-    "Input: [Frame of a fast-paced action scene]\n"
-    "Output: A red sports car drifts aggressively around a tight city corner during a high-speed pursuit. Pedestrians on the sidewalk blur in the background as they turn and scramble for cover.\n\n"
-    "Input: [Frame of a quiet dialogue scene]\n"
-    "Output: Three professionals sit around a glass conference table in a brightly lit office. One woman stands pointing at a line graph on a whiteboard while the other two watch her attentively.\n\n"
-    "Input: [Frame of an emotional close-up]\n"
-    "Output: A close-up shot shows a young man staring out a rain-streaked window in a dark room. A single tear rolls down his cheek, conveying a strong sense of sorrow."
+    "and any visible reaction from other subjects. "
+    "CRITICAL: Describe ONLY what is explicitly visible in this image. Do not assume "
+    "typical or expected scene behavior based on props alone (for example, do not "
+    "assume people are eating just because a dining table is present, or that a room "
+    "is calm just because it looks furnished). Pay close attention to anything unusual, "
+    "unexpected, or anomalous -- items on the floor, unusual body positions, weapons, "
+    "spills, or anyone not clearly participating in an ordinary activity. "
+    "If you are not confident about a detail, do not state it as fact. "
+    "Do not include greetings, offers of further help, meta-commentary, or markdown."
 )
 
 # Short prompt for small models (e.g. FastVLM 0.5B).
@@ -189,6 +187,65 @@ def _validate_or_fallback(raw: str, fallback: str) -> str:
         return fallback
 
     return cleaned
+
+
+def caption_frame_delta(
+    primary_frame: np.ndarray,
+    secondary_frame: np.ndarray,
+    prompt: Optional[str] = None,
+    max_tokens: int = 80,
+) -> str:
+    """
+    Generate a brief addendum describing what is NEW or DIFFERENT in the
+    secondary keyframe compared to the primary (Fix 2 — DECISIONS.md §20.2).
+
+    Called at most ONCE per long event where needs_secondary_frame() returns
+    a non-None index.  The result is appended to the primary summary, not
+    used as a replacement.  Returns "" on any failure (caller ignores it).
+
+    This is a targeted one-sentence addendum, NOT a full scene description --
+    max_tokens is intentionally smaller than generate_summary() to keep cost low.
+
+    Args:
+        primary_frame:   The already-captioned primary keyframe (for model context).
+        secondary_frame: The high-salience secondary keyframe to describe.
+        prompt:          Custom delta prompt, or None for the default.
+        max_tokens:      Maximum tokens for the addendum response.
+
+    Returns:
+        str: One-sentence addendum or "" on failure.
+    """
+    if secondary_frame is None:
+        return ""
+    if not _vlm_available():
+        return ""
+
+    default_prompt = (
+        "Describe anything new or different in this second image compared to a "
+        "calm establishing shot, focusing on people, objects, or actions that were "
+        "not present before. One sentence only."
+    )
+    effective_prompt = prompt if prompt else default_prompt
+
+    delta_system = (
+        "You are a factual video-event data extractor. "
+        "You will see a second frame from the same event. "
+        "Describe ONLY what is new, changed, or anomalous compared to the earlier "
+        "part of the event. Describe only what is explicitly visible. "
+        "One sentence maximum. No greetings, no meta-commentary."
+    )
+    try:
+        raw = _call_vlm(delta_system, secondary_frame, max_tokens=max_tokens)
+        if not raw or len(raw) < 5:
+            return ""
+        # Apply filler check -- the same gate as generate_summary
+        for pattern in _FILLER_PATTERNS:
+            if pattern.search(raw):
+                return ""
+        return raw.strip()
+    except Exception as exc:
+        logger.debug("AESE summary: caption_frame_delta failed: %s", exc)
+        return ""
 
 
 # ---------------------------------------------------------------------------
