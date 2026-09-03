@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,50 @@ _SCENE_LABELS = SCENE_LABELS
 # CLIP text features cached at first call (fallback path)
 _clip_text_features = None
 _clip_labels_loaded = False
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 — Deterministic graphics/end-card pre-check (DECISIONS.md §20.3)
+# ---------------------------------------------------------------------------
+
+def is_graphics_or_endcard(image: np.ndarray) -> bool:
+    """
+    Detect flat graphics/logo/end-card frames BEFORE any VLM or CLIP call.
+
+    Flat title/logo cards share two characteristics that are unlike any real
+    filmed location:
+      - Very low color variance (solid or near-solid background)
+      - Very low edge density (minimal fine detail/texture)
+
+    Thresholds (DECISIONS.md §20.3):
+      color_std < 18.0   — standard deviation across all pixels and channels
+      edge_density < 0.015 — fraction of non-zero Canny-edge pixels
+
+    IMPORTANT — tuning note:
+      These values were set per contract specification. Before production use,
+      validate against real dark-but-detailed film frames (night scenes, dimly
+      lit interiors) to confirm they do NOT fire on legitimate dark content.
+      A genuinely dark scene has near-zero color_std but retains real edge
+      structure (actors, furniture, props) giving edge_density well above 0.015.
+      A flat logo card on a black background has both: near-zero variance AND
+      near-zero edges except for the logo itself (which keeps edge_density low
+      overall across the full frame).
+
+    Args:
+        image: HxWx3 RGB numpy array. Caller guarantees image is not None.
+
+    Returns:
+        True if the frame looks like a graphics/logo/end-card; False otherwise.
+    """
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        color_std = float(np.std(image))
+        edges = cv2.Canny(gray, 50, 150)
+        edge_density = float(np.count_nonzero(edges)) / edges.size
+        return color_std < 18.0 and edge_density < 0.015
+    except Exception as exc:
+        logger.debug("AESE scene_label: is_graphics_or_endcard() failed: %s", exc)
+        return False  # fail-safe: don't misclassify on error
 
 
 def _clip_available() -> bool:
@@ -87,20 +132,33 @@ def label_scene(image: np.ndarray) -> str:
     """
     Classify the scene label of a single frame.
 
+    Pre-check:    Deterministic graphics/end-card detection (no model call).
     Primary path: Active VLM backend via vlm_router (fastvlm / gemma4).
     Fallback 1:   CLIP zero-shot (if open_clip is available).
     Fallback 2:   Color-temperature heuristic (last resort).
 
-    Args:
-        image: HxWx3 RGB numpy array. Must not be None (caller filters None images).
-               Black frames (image.max() < 5) short-circuit to "unknown".
-
     Returns:
-        str: One of the labels in SCENE_LABELS. ALWAYS returns a str, never None.
+        str: One of the labels in SCENE_LABELS, or "graphics/end card" for
+             flat title/logo/end-card frames detected by the pre-check.
+             ALWAYS returns a str, never None or raises.
              Returns "unknown" on any failure.
+
+    Note:
+        "graphics/end card" is NOT in SCENE_LABELS — it is returned by the
+        pre-check only, never by the VLM or CLIP paths.
     """
     if image is None or image.max() < 5:
         return "unknown"
+
+    # --- Pre-check: deterministic graphics/end-card detection (§20.3) ---
+    # Short-circuits before any VLM or CLIP call -- no model cost.
+    # Pure black frames (image.max() < 5) are caught above and returned as
+    # "unknown" (technical artifact, not an identifiable end-card). This
+    # pre-check fires for frames that DO have a logo/title element against
+    # a flat background (low variance + low edge density overall).
+    if is_graphics_or_endcard(image):
+        logger.debug("AESE scene_label: graphics/end-card pre-check fired -- skipping VLM/CLIP")
+        return "graphics/end card"
 
     # --- Path 1: Active VLM backend (fastvlm / gemma4 / yunet via router) ---
     try:
