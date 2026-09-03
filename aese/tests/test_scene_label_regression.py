@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_scene_label_regression.py
 Regression and contract tests for aese/adapters/scene_label.py.
 
@@ -101,16 +101,26 @@ def test_scene_labels_contains_unknown():
 
 
 def test_label_scene_output_in_vocabulary():
-    """Any non-None output from label_scene() must be in SCENE_LABELS."""
+    """
+    Any non-None output from label_scene() must be in SCENE_LABELS OR equal to
+    "graphics/end card" (the pre-check bypass label added in Fix 3, §20.3).
+
+    "graphics/end card" is intentionally NOT added to SCENE_LABELS -- it is
+    returned by is_graphics_or_endcard() before any VLM or CLIP call, so it
+    bypasses the model vocabulary entirely.  Flat monochrome images (like
+    np.full(200)) legitimately trigger this check.
+    """
+    _VALID_LABELS = set(SCENE_LABELS) | {"graphics/end card"}
     test_images = [
-        np.full((64, 64, 3), 200, dtype=np.uint8),   # bright neutral
+        np.full((64, 64, 3), 200, dtype=np.uint8),   # bright neutral (may hit endcard check)
         np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8),  # noise
         np.zeros((64, 64, 3), dtype=np.uint8),        # black
     ]
     for img in test_images:
         result = label_scene(img)
-        assert result in SCENE_LABELS, (
-            f"label_scene() returned {result!r}, which is not in SCENE_LABELS={SCENE_LABELS}"
+        assert result in _VALID_LABELS, (
+            f"label_scene() returned {result!r}, which is not in valid label set "
+            f"(SCENE_LABELS ∪ {{'graphics/end card'}})"
         )
 
 
