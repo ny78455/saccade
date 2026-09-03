@@ -541,3 +541,151 @@ If `torch.cuda.is_available()` returns `False` at runtime:
   is the correct next step.  That is a different, larger technique with different
   tradeoffs and is explicitly out of scope for this contract.
 
+---
+
+## 20. PERCEPTION FIXES — Salience Keyframe, End-Card Detection, Anti-Hallucination, Caption Reconciliation
+
+**Date:** 2026-09-03
+
+Four real perception failures identified on the Andhadhun clip (162s, 11 events).
+Each fixed with the minimum surgical change, no regression to call-frequency work.
+
+---
+
+### 20.1 — Salience-Based Keyframe Selection (`keyframe.py`)
+
+**Root cause:** `select_keyframe(strategy="lowest_blur")` was the default for the
+summary/caption pipeline.  "Lowest blur" = lowest motion_score = the calmest frame.
+For a 26s event containing a dramatic reveal at second 20, the calmest frame is
+precisely the wrong one to caption.
+
+**Fix:** New `"most_salient"` strategy selects the frame with the highest
+`motion_score + novelty_score` — the peak of narrative activity, not of visual
+stillness.  Changed to the new default in `pipeline.py::EventConstructor` init.
+`"lowest_blur"` is kept as a named option for thumbnail generation where visual
+clarity matters more than narrative content.
+
+**Quality tradeoff:** High-motion frames may have motion blur, producing slightly
+less sharp VLM input than a fully static frame would.  This is acceptable because
+narrative accuracy (what is happening) matters more for event summaries than
+photographic clarity.
+
+**Regression tests:** `test_salient_keyframe_picks_motion_novelty_peak`,
+`test_salient_keyframe_not_lowest_blur`, `test_default_strategy_is_most_salient`
+
+---
+
+### 20.2 — Gated Secondary Keyframe for Long Events (`keyframe.py`, `pipeline.py`)
+
+**Root cause:** Even with salience-based primary selection, a single frame cannot
+cover all meaningful moments in a long event (26s in the Andhadhun clip: a calm
+first half followed by a dramatic reveal).
+
+**Fix:** `needs_secondary_frame(features, primary_idx, duration_s)` returns a
+secondary index when ALL of:
+  1. `duration_s > 15.0` — event is long enough to plausibly have multiple moments
+  2. Salience of candidate > `0.7` — high in absolute terms, not just locally higher
+  3. Candidate timestamp > `8 s` away from primary — plausibly a different scene moment
+
+When all three fire, `_finalize_event()` issues ONE additional `caption_frame_delta()`
+call and appends the one-sentence addendum to the primary summary.
+
+**Speed protection:** This gate is designed to fire on ≪ 10% of events.  For the
+81s fight clip used in §17's speed regression, all events are ≤ 26s and most have
+low overall salience — the gate fires only when there is real, distant, high-energy
+content the primary frame missed.  The recent per-event call-frequency fix (§18)
+is not regressed by this change.
+
+**Regression tests:** `test_needs_secondary_long_event_with_spike`,
+`test_needs_secondary_short_event_returns_none`,
+`test_needs_secondary_no_qualifying_distant_spike_returns_none`,
+`test_needs_secondary_below_salience_threshold_returns_none`
+
+---
+
+### 20.3 — Deterministic Graphics/End-Card Detection (`scene_label.py`)
+
+**Root cause:** Event 10 (162–175s, solid black frame with red Netflix 'N' logo)
+was classified as `"office"` by the heuristic fallback in `_heuristic_scene_label()`.
+The VLM path was not active in this run, and the color-temperature heuristic
+defaults to `"office"` for any warm/neutral frame it can't classify as outdoor.
+
+**Fix:** `is_graphics_or_endcard(image)` runs before any VLM or CLIP call:
+```
+color_std  = np.std(image)        # variance across all pixels and channels
+edge_density = count_nonzero(Canny(gray)) / total_pixels
+if color_std < 18.0 and edge_density < 0.015: return "graphics/end card"
+```
+Returns `"graphics/end card"` — NOT added to `SCENE_LABELS` since it is a pre-check
+bypass, not a model classification.  The existing `image.max() < 5` black-frame guard
+runs first (returns `"unknown"` for pure fade-to-black, not end-card).
+
+**Threshold rationale:**
+- `color_std < 18.0`: A real filmed scene with any texture/colour variation exceeds
+  this easily. A solid-background title card does not.
+- `edge_density < 0.015`: A real scene with actors and furniture has many edges.
+  A logo on a plain background has a low fraction of edge pixels across the full frame.
+
+**REQUIRED before production:** Validate both thresholds against real dark-but-detailed
+film frames (night scenes, dimly lit interiors, silhouette shots).  A genuinely dark
+dramatic scene should have retained edge structure (actor silhouettes, props) giving
+`edge_density` comfortably above `0.015`, even if `color_std` is low.
+
+**Regression tests:** `test_endcard_detected_without_vlm_call`,
+`test_dark_film_frame_not_classified_as_endcard`, `test_pure_black_frame_not_endcard`
+
+---
+
+### 20.4 — Anti-Hallucination + Anomaly-Attention Prompt (`summary.py`)
+
+**Root cause:** Event 4 summary contained "A woman is standing near the table,
+gesturing while two other people are seated" when the actual scene contained a
+body and blood (confirmed in the ground truth).  The previous `SUMMARY_SYSTEM_PROMPT`
+instructed the model to describe the scene but did not explicitly forbid
+prop-based inference or require attention to anomalies.
+
+**Fix:** `SUMMARY_SYSTEM_PROMPT` updated with:
+- Explicit prohibition on prop-based assumption ("do not assume people are eating
+  just because a dining table is present")
+- Explicit anomaly-attention directive ("pay close attention to anything unusual,
+  unexpected, or anomalous — items on the floor, unusual body positions, weapons")
+- Epistemic humility clause ("if you are not confident about a detail, do not
+  state it as fact")
+
+**This is a mitigation, not a guarantee.** A 2B/E2B-class VLM will still
+hallucinate sometimes.  The before/after on Event 4 should be re-run when a GPU
+is available and recorded here.  README.md now contains an explicit disclaimer.
+
+**Before (Event 4):** *"A woman is standing near the table, gesturing while two
+other people are seated."*
+**After (PLACEHOLDER — run on GPU with updated prompt and record here):**
+
+---
+
+### 20.5 — Caption-Text Character Count Reconciliation (`caption_person_count.py`, `pipeline.py`)
+
+**Root cause:** Events 1, 2, 3, 6 all have `max_characters_seen=1` despite the VLM's
+own generated caption describing two people ("a man who is partially visible on the
+right", "A man with a beard and sunglasses is visible on the right side").  OpenCV
+face detection cannot count people who are facing away, partially cropped, or viewed
+from behind — a common alternating-angle pattern in dialogue.
+
+**Fix:** `estimate_person_count_from_caption(summary_text)` parses the generated
+summary for person-count signals:
+  1. Explicit count words: "two people", "three individuals" → direct numeric return
+  2. Person-phrase count: distinct singular mentions ("a man", "a woman", "the person")
+
+Applied in `_finalize_event()` AFTER `generate_summary()`. Only raises
+`max_characters_seen`; never lowers a face-detector-confirmed count.
+
+**Honesty rule:** The face-detector count is a hard real observation (a face was
+actually seen).  The caption estimate is a softer signal (VLM can also be wrong).
+Treating the caption as a floor rather than a replacement keeps the system honest:
+  - If face detector found 2 and caption says "a man" → stays 2
+  - If face detector found 1 and caption says "a man and a woman" → raised to 2
+  - Every raise is logged at INFO level so discrepancies remain visible
+
+**Regression tests:** `test_caption_raises_count_when_face_detector_missed`,
+`test_caption_explicit_two_people`, `test_caption_explicit_three_individuals`,
+`test_caption_no_people_returns_none`, `test_caption_never_lowers_detector_count`
+
