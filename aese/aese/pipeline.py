@@ -41,6 +41,7 @@ from .adapters.character_naming import (
     apply_resolved_names,
     extract_name_mentions,
 )
+from .adapters.caption_person_count import estimate_person_count_from_caption
 from .aggregator import FeatureAggregator
 from .boundary.candidate_detector import CandidateDetector
 from .context_buffer import ContextBuffer
@@ -49,8 +50,8 @@ from .event_constructor import EventConstructor, build_template_summary
 from .event_embedding import pool_event_embedding
 from .event_graph import EventGraph
 from .event_merge import OnlineMerger
-from .keyframe import select_keyframe
-from .summary import generate_summary, _summary_call_counter
+from .keyframe import select_keyframe, select_keyframe_salient, needs_secondary_frame
+from .summary import generate_summary, caption_frame_delta, _summary_call_counter
 from .types import AESEConfig, Event, FramePacket
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,13 @@ def _finalize_event(
 ) -> None:
     """
     Assign contiguous ID, assign character labels, feed name evidence to the
-    binder, and generate the final summary.
+    binder, generate the final summary, and apply perception fixes:
+
+    Fix 1: Keyframe is already selected with "most_salient" strategy.
+    Fix 2: If the event is long (>15s) with a high-salience secondary spike,
+           issue ONE additional targeted VLM call and append the addendum.
+    Fix 5: Reconcile face-detector count with caption-text person estimate.
+           Only raises max_characters_seen; never lowers it.
 
     Character naming:
       After get_character_labels_for_event() resolves the cluster labels for
@@ -107,7 +114,7 @@ def _finalize_event(
             for mention in extract_name_mentions(dialogue_text, event.start_time_ms):
                 binder.observe(mention, event.character_labels)
 
-    # --- Summary generation ---
+    # --- Primary summary generation ---
     keyframe_image = None
     if event.key_frame is not None and hasattr(event.key_frame, 'shape') and event.key_frame.ndim == 3:
         keyframe_image = event.key_frame
@@ -118,6 +125,53 @@ def _finalize_event(
             scene_label=event.location_label or "unknown",
             max_characters_seen=event.max_characters_seen,
         )
+
+    # --- Fix 2: Gated secondary keyframe for long events with a missed spike ---
+    # Fires ONLY when: duration > 15s AND a high-salience (>0.7) frame exists
+    # that is >8s away from the primary keyframe timestamp. Designed to fire
+    # on <10% of typical events. Gate is deliberately narrow to protect the
+    # per-event call-frequency fix from round 18 (DECISIONS.md §20.2).
+    event_feats = event_features_map.get(event.event_id, []) if event_features_map else []
+    if event_feats and keyframe_image is not None:
+        duration_s = event.duration_ms / 1000.0
+        # Find primary keyframe index (match by salient peak within stored features)
+        from .keyframe import select_keyframe_salient, needs_secondary_frame as _nsf
+        import numpy as _np
+        sal = [f.motion_score + f.novelty_score for f in event_feats]
+        primary_idx = int(_np.argmax(sal)) if sal else 0
+        secondary_idx = _nsf(event_feats, primary_idx, duration_s)
+        if secondary_idx is not None:
+            sec_feat = event_feats[secondary_idx]
+            secondary_frame = (
+                sec_feat.representative_image
+                if sec_feat.representative_image is not None
+                else None
+            )
+            if secondary_frame is not None:
+                logger.info(
+                    "AESE: secondary keyframe gate fired for event %d "
+                    "(duration=%.1fs, secondary_idx=%d, salience=%.2f)",
+                    event.event_id, duration_s, secondary_idx,
+                    sal[secondary_idx] if sal else 0.0,
+                )
+                addendum = caption_frame_delta(keyframe_image, secondary_frame)
+                if addendum:
+                    event.summary = f"{event.summary} {addendum}".strip()
+
+    # --- Fix 5: Caption-text character count reconciliation ---
+    # Used ONLY to raise max_characters_seen; never lowers the detector count.
+    # A face-detector-confirmed count is a hard observation; caption estimate
+    # is softer and could be a VLM error (DECISIONS.md §20.5).
+    caption_estimate = estimate_person_count_from_caption(event.summary)
+    if caption_estimate is not None:
+        current = event.max_characters_seen or 0
+        if caption_estimate > current:
+            logger.info(
+                "AESE: caption text implies %d people but face detector found %d "
+                "for event %d -- raising max_characters_seen to caption estimate",
+                caption_estimate, current, event.event_id,
+            )
+            event.max_characters_seen = caption_estimate
 
 
 def run(
@@ -146,7 +200,7 @@ def run(
     constructor = EventConstructor(
         config=config,
         event_embedding_fn=pool_event_embedding,
-        keyframe_fn=lambda features: select_keyframe(features, strategy="lowest_blur"),
+        keyframe_fn=lambda features: select_keyframe(features, strategy="most_salient"),
     )
     merger = OnlineMerger(config)
     event_graph = EventGraph()
