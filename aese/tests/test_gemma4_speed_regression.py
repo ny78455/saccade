@@ -308,7 +308,7 @@ def test_select_dtype_returns_float16_on_cuda():
     When CUDA is available, _select_dtype() must return torch.float16.
     Contract §19 — GPU users get fp16 for the ~1.5-2x bandwidth reduction.
     """
-    import torch
+    torch = pytest.importorskip("torch", reason="torch not installed")
     from aese.adapters._dtype_utils import _select_dtype
 
     with patch("torch.cuda.is_available", return_value=True):
@@ -326,7 +326,7 @@ def test_select_dtype_returns_float32_on_cpu():
     Contract §19 — CPU fp16 kernels are poorly optimised; float32 is the safe
     choice that avoids paying conversion overhead for no speed benefit.
     """
-    import torch
+    torch = pytest.importorskip("torch", reason="torch not installed")
     from aese.adapters._dtype_utils import _select_dtype
 
     with patch("torch.cuda.is_available", return_value=False):
@@ -344,7 +344,7 @@ def test_select_dtype_not_float16_on_cpu():
     This is the single most common way this kind of change makes things *slower*
     rather than faster — guard against regressions here.
     """
-    import torch
+    torch = pytest.importorskip("torch", reason="torch not installed")
     from aese.adapters._dtype_utils import _select_dtype
 
     with patch("torch.cuda.is_available", return_value=False):
@@ -366,8 +366,9 @@ def _make_mock_model_and_processor(decoded_output: str):
     inference call producing `decoded_output` when decoded.
 
     Returns (mock_model, mock_processor, mock_inputs).
+    Skips (via pytest.importorskip) if torch is not installed.
     """
-    import torch
+    torch = pytest.importorskip("torch", reason="torch not installed")
 
     mock_model = MagicMock()
     mock_model.device = "cpu"
