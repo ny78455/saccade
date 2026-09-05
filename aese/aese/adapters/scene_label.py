@@ -48,24 +48,30 @@ def is_graphics_or_endcard(image: np.ndarray) -> bool:
     """
     Detect flat graphics/logo/end-card frames BEFORE any VLM or CLIP call.
 
-    Flat title/logo cards share two characteristics that are unlike any real
-    filmed location:
-      - Very low color variance (solid or near-solid background)
-      - Very low edge density (minimal fine detail/texture)
+    Two-path check (DECISIONS.md §21.4) — covers both classes of end-card:
 
-    Thresholds (DECISIONS.md §20.3):
-      color_std < 18.0   — standard deviation across all pixels and channels
-      edge_density < 0.015 — fraction of non-zero Canny-edge pixels
+    Path 1 — Flat near-monochrome card (grey title card, watermark on white):
+      color_std < 18.0    — near-solid background, very low variance
+      edge_density < 0.015 — minimal fine structure
 
-    IMPORTANT — tuning note:
-      These values were set per contract specification. Before production use,
-      validate against real dark-but-detailed film frames (night scenes, dimly
-      lit interiors) to confirm they do NOT fire on legitimate dark content.
-      A genuinely dark scene has near-zero color_std but retains real edge
-      structure (actors, furniture, props) giving edge_density well above 0.015.
-      A flat logo card on a black background has both: near-zero variance AND
-      near-zero edges except for the logo itself (which keeps edge_density low
-      overall across the full frame).
+    Path 2 — Dark background with logo (Netflix-style: colored letter on black):
+      dark_fraction > 0.70 — >70% of pixels are near-black (gray < 15)
+      color_std < 30.0     — low overall variance despite the colored logo
+                             (the logo occupies only a small fraction of the frame)
+
+    Why Path 2 is needed: a red 'N' on a black background has dark_fraction ≈ 0.85
+    but color_std ≈ 25 (the red pixels are a small fraction of the total).  A real
+    dark dramatic scene retains color variation from actors, props, and practical
+    light sources, giving color_std > 30 in practice.
+
+    Pure black frames (image.max() < 5): dark_fraction=1.0, color_std=0.0 → Path 2
+    fires. These return "graphics/end card" (a fade-to-black is not a real scene
+    location). The previous "unknown" return for black frames is replaced by
+    "graphics/end card" — see DECISIONS.md §21.4 for rationale.
+
+    REQUIRED before production: validate Path 2 thresholds against real night scenes
+    and silhouette shots where dark_fraction may be > 0.70 but color_std should
+    stay above 30 due to actor outlines and practical light sources.
 
     Args:
         image: HxWx3 RGB numpy array. Caller guarantees image is not None.
@@ -76,9 +82,19 @@ def is_graphics_or_endcard(image: np.ndarray) -> bool:
     try:
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         color_std = float(np.std(image))
+
+        # Path 1: flat near-monochrome card
         edges = cv2.Canny(gray, 50, 150)
         edge_density = float(np.count_nonzero(edges)) / edges.size
-        return color_std < 18.0 and edge_density < 0.015
+        if color_std < 18.0 and edge_density < 0.015:
+            return True
+
+        # Path 2: dark background with small colored logo (or pure black)
+        dark_fraction = float(np.mean(gray < 15))
+        if dark_fraction > 0.70 and color_std < 30.0:
+            return True
+
+        return False
     except Exception as exc:
         logger.debug("AESE scene_label: is_graphics_or_endcard() failed: %s", exc)
         return False  # fail-safe: don't misclassify on error
@@ -146,16 +162,19 @@ def label_scene(image: np.ndarray) -> str:
     Note:
         "graphics/end card" is NOT in SCENE_LABELS — it is returned by the
         pre-check only, never by the VLM or CLIP paths.
+
+        Pure black frames (image.max() < 5) also return "graphics/end card"
+        via the pre-check Path 2 (dark_fraction=1.0 > 0.70, color_std=0 < 30).
+        This replaces the previous "unknown" return for black frames — a
+        fade-to-black is not a real scene location (DECISIONS.md §21.4).
     """
-    if image is None or image.max() < 5:
+    if image is None:
         return "unknown"
 
-    # --- Pre-check: deterministic graphics/end-card detection (§20.3) ---
-    # Short-circuits before any VLM or CLIP call -- no model cost.
-    # Pure black frames (image.max() < 5) are caught above and returned as
-    # "unknown" (technical artifact, not an identifiable end-card). This
-    # pre-check fires for frames that DO have a logo/title element against
-    # a flat background (low variance + low edge density overall).
+    # --- Pre-check: deterministic graphics/end-card detection (§21.4) ---
+    # Path 1 catches flat near-monochrome cards. Path 2 catches dark-bg
+    # colored logos and pure black frames. Both short-circuit before any
+    # VLM or CLIP call.
     if is_graphics_or_endcard(image):
         logger.debug("AESE scene_label: graphics/end-card pre-check fired -- skipping VLM/CLIP")
         return "graphics/end card"
