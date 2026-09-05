@@ -252,3 +252,60 @@ def get_active_detector_mode() -> str:
         return mod.get_active_detector_mode()
     except Exception:
         return "unavailable"
+
+
+def describe_batch(
+    images: list,
+    contexts: list,
+) -> list:
+    """
+    Process N event keyframes in a single batched VLM call where supported.
+
+    Fix 2 / §22.2 routing layer.
+
+    For the gemma4 backend, routes to gemma4.describe_batch() which processes all
+    images in one generate() call using the batch dimension (see gemma4.py §22.2).
+
+    For fastvlm and yunet backends (which do not support batched multi-image
+    generation), falls back to sequential describe_scene_and_caption() calls —
+    the API contract is identical for callers in pipeline.run_enrichment_phase().
+
+    Args:
+        images:   List of N RGB numpy arrays (or None for events without a keyframe).
+        contexts: List of N context dicts: {action_label, dialogue_text, scene_labels}.
+
+    Returns:
+        List of N (scene_label, caption) tuples in input order.
+        Never raises; falls back to ("unknown", "") on failure.
+    """
+    mod = _adapter()
+    if mod is None:
+        return [("unknown", "")] * len(images)
+
+    # Gemma-4 native batch path
+    if _backend == "gemma4" and hasattr(mod, "describe_batch"):
+        try:
+            return mod.describe_batch(images, contexts)
+        except Exception as exc:
+            logger.warning(
+                "AESE VLM router: describe_batch error (%s): %s -- sequential fallback.",
+                _backend, exc,
+            )
+
+    # Sequential fallback for all other backends (fastvlm, yunet)
+    results = []
+    for img, ctx in zip(images, contexts):
+        if img is None:
+            results.append(("unknown", ""))
+            continue
+        try:
+            results.append(describe_scene_and_caption(
+                img,
+                action_label=ctx.get("action_label", "static"),
+                dialogue_text=ctx.get("dialogue_text"),
+                scene_labels=ctx.get("scene_labels"),
+            ))
+        except Exception as exc:
+            logger.debug("AESE VLM router: describe_batch sequential item failed: %s", exc)
+            results.append(("unknown", ""))
+    return results
