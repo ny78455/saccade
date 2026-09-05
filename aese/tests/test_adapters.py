@@ -128,8 +128,10 @@ def test_scene_label_returns_valid():
 
 
 def test_scene_label_black_frame():
+    # §21.4: pure black now returns 'graphics/end card' via Path 2
+    # (dark_fraction=1.0 > 0.70, color_std=0 < 30). Not 'unknown'.
     result = label_scene(_make_black_frame())
-    assert result == "unknown"
+    assert result == "graphics/end card"
 
 
 def test_scene_label_none():
