@@ -539,7 +539,7 @@ def _make_novelty_buffer(novelty_values):
     from aese.types import AESEConfig, TemporalFeature
     from aese.adapters.embedding import EMBEDDING_DIM
     config = AESEConfig()
-    buf = ContextBuffer(config)
+    buf = ContextBuffer(config.buffer_seconds)
     for i, nov in enumerate(novelty_values):
         tf = TemporalFeature(
             timestamp_ms=float(i * 1000),
