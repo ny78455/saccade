@@ -50,6 +50,21 @@ _processor = None
 _gemma4_available: bool | None = None   # None = not yet attempted
 _load_lock = threading.Lock()
 
+# Fix 2 / §22.2 — batched generation
+# Conservative starting batch size; tune upward with benchmark_speedup.py.
+# OOM risk: each image + prompt pair occupies VRAM proportional to token count.
+# At BATCH_SIZE=4 with 512px images and ~120 output tokens, peak VRAM usage
+# is roughly 4x single-event usage — safe on 16GB+ GPUs, marginal on 8GB.
+BATCH_SIZE: int = 4
+
+# Fix 4 / §22.4 — torch.compile probe results (set by _ensure_loaded)
+_compiled: bool = False        # True if torch.compile was applied successfully
+_warmup_done: bool = False     # True if warmup() has completed
+
+# _supports_batching() probe result (None = not yet tested)
+_batching_supported: bool | None = None
+_batching_lock = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Internal: load model once
@@ -120,8 +135,33 @@ def _ensure_loaded() -> bool:
                     device_map="auto",
                 )
             _model.eval()
+
+            # Fix 4 / §22.4 — torch.compile for repeated same-shape inference.
+            # mode="reduce-overhead" trades ~30-60s one-time compile cost for
+            # 15-30% per-call throughput gain on repeated generate() calls.
+            # Only applied on CUDA (CPU torch.compile has no meaningful benefit
+            # for transformer inference and can be slower due to overhead).
+            # warmup() must be called after load to amortize compile cost at
+            # startup rather than on the first real event's timing window.
+            global _compiled
+            if torch.cuda.is_available():
+                try:
+                    _model = torch.compile(_model, mode="reduce-overhead")
+                    _compiled = True
+                    logger.info(
+                        "AESE Gemma-4: torch.compile applied (mode=reduce-overhead). "
+                        "Call warmup() to amortize compile cost before first real event."
+                    )
+                except Exception as compile_exc:
+                    logger.warning(
+                        "AESE Gemma-4: torch.compile failed (%s) — running uncompiled. "
+                        "This is non-fatal; inference still works.",
+                        compile_exc,
+                    )
+                    _compiled = False
+
             _gemma4_available = True
-            logger.info("AESE Gemma-4: model loaded successfully (dtype=%s).", dtype)
+            logger.info("AESE Gemma-4: model loaded successfully (dtype=%s, compiled=%s).", dtype, _compiled)
         except ImportError as exc:
             logger.warning(
                 "AESE Gemma-4: load failed (missing dependency: %s). "
@@ -145,6 +185,26 @@ def get_active_detector_mode() -> str:
     if _gemma4_available is None:
         _ensure_loaded()
     return "gemma4" if _gemma4_available else "unavailable"
+
+
+def warmup() -> None:
+    """
+    Fire one dummy generate() pass to trigger torch.compile's JIT compilation.
+
+    Must be called AFTER _ensure_loaded() returns True and BEFORE the first
+    real event's timing window starts. Calling it in a background thread during
+    Phase 1 (CPU-bound) ensures compile finishes before Phase 2 (GPU-bound).
+
+    Safe to call multiple times — subsequent calls are no-ops.
+    """
+    global _warmup_done
+    if _warmup_done or not _ensure_loaded():
+        return
+    logger.info("AESE Gemma-4: running warmup pass (triggers torch.compile JIT)...")
+    _ask(np.zeros((64, 64, 3), dtype=np.uint8), "warmup", max_new_tokens=5)
+    _warmup_done = True
+    logger.info("AESE Gemma-4: warmup complete.")
+
 
 
 # ---------------------------------------------------------------------------
