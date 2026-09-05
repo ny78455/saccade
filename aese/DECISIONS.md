@@ -689,3 +689,152 @@ Treating the caption as a floor rather than a replacement keeps the system hones
 `test_caption_explicit_two_people`, `test_caption_explicit_three_individuals`,
 `test_caption_no_people_returns_none`, `test_caption_never_lowers_detector_count`
 
+
+---
+
+## 21. ROUND 21 FIXES — POSTURE PROMPT, NOVELTY SPLIT, FACE ReID, GRAPHICS ROBUSTNESS
+
+### 21.1 Posture/Spatial-Reasoning Prompt Directive
+
+**Symptom:** Event 4 summary described a prone body as "seated on a blue armchair".
+The VLM's object-prior bias — a large blue armchair dominating the frame — pulled the
+description toward the most statistically common action associated with that object
+(sitting in it).
+
+**Fix:** Added an explicit POSTURE AND SPATIAL REASONING clause to `SUMMARY_SYSTEM_PROMPT`
+in `summary.py`. Key directive: "If a body or limbs are aligned horizontally along
+the floor plane, or a person appears motionless and prone, state explicitly that a
+person is lying on the floor — do not default to 'seated' or 'standing' based on
+nearby objects alone."
+
+**Limitations (documented per contract):** This is a prompt-level mitigation, not a
+guaranteed fix. Small VLMs (e.g. FastVLM 0.5B) have a strong object-prior bias baked
+into their pretraining distribution. A sofa or armchair dominating the frame may still
+override the prompt directive if the model's prior is very strong. Before production,
+spot-check the specific Andhadhun frame that produced the "seated" misclassification
+to confirm the prompt materially changes the output. Log before/after comparisons; do
+not assert as a guaranteed pass in the test suite.
+
+**Regression tests:** `test_posture_prompt_contains_spatial_reasoning`,
+`test_posture_prompt_contains_furniture_warning`
+
+---
+
+### 21.2 Novelty-Based Mid-Event Split Trigger
+
+**Symptom:** Event 9 (136–162s, 26s duration) was never split at the gunman reveal
+(~160s). The prior round's salience gate (needs_secondary_frame + caption addendum)
+added descriptive context but did NOT produce a real event split. The reveal is a slow,
+deliberate entrance — no fast movement, no camera cut — so neither the `scene_change`
+hard trigger nor the `motion_spike` hard trigger could see it.
+
+**Root cause confirmed:** `CandidateDetector` had exactly two hard triggers before this
+fix: `scene_change` (camera cut, camera_cue='cut') and `motion_spike` (2 consecutive
+fast_action seconds). Slow reveals never produce fast_action; no camera cut occurs.
+
+**Fix:** Added a third hard trigger `novelty_spike` in `candidate_detector.py`:
+- `_seconds_since_boundary` counter tracks how long the current event has been open
+  (no external reference to EventConstructor needed).
+- `_check_novelty_spike(curr)` reads the last 4 buffer entries: 3 for baseline,
+  1 current. Fires when:
+  - `curr.novelty_score >= NOVELTY_SPIKE_THRESHOLD (0.35)` — absolute floor
+  - `curr.novelty_score >= baseline * NOVELTY_SPIKE_RATIO (2.5)` — relative jump
+- Outer gate: only fires when `_seconds_since_boundary > 15.0` (prevents it becoming
+  a general-purpose high-frequency trigger on short events).
+- Returns `BoundaryDecision(is_boundary=True, confidence=0.80, dominant_signal="novelty_spike")`.
+
+**Threshold rationale:**
+- `NOVELTY_SPIKE_THRESHOLD = 0.35`: ambient novelty in this clip ranges 0.2–0.3.
+  A threshold of 0.35 is just above the noise floor; a real reveal produces 0.5–0.7.
+- `NOVELTY_SPIKE_RATIO = 2.5`: a sustained spike (baseline already elevated to 0.35)
+  won't re-trigger — only a stepwise jump fires.
+- `NOVELTY_SPIKE_MIN_DURATION_S = 15.0`: camera cuts handle short events; the novelty
+  trigger is specifically for long, cut-free events.
+
+**Regression tests:** `test_novelty_spike_check_fires_on_slow_reveal`,
+`test_novelty_spike_duration_guard`, `test_motion_gate_does_not_fire_on_slow_reveal`
+
+---
+
+### 21.3 Exemplar Gallery + Appearance Descriptor for Face Clustering
+
+**Symptom:** Events 0–7 all show "Person A" regardless of which actor appears —
+confirming the single-cluster identity-flip failure from the stress test.
+
+**Root cause confirmed:** `character_cluster.py._embed_face_crop()` used CLIP image
+encoder — a general-purpose image-text matching model, not trained for identity
+discrimination. `CharacterClusterer` used an EMA centroid update rule (0.9 old + 0.1 new).
+After enough alternating shots of two actors, the centroid drifts toward the midpoint
+between the two actors' embeddings, after which both get assigned to the same cluster.
+
+**Fix Part A — Exemplar gallery (replaces EMA centroid):**
+`CharacterClusterer` now stores up to `max_exemplars` (5) raw embeddings per cluster.
+Assignment matches against the BEST (minimum-distance) exemplar in each gallery, not a
+drifting mean. This is mathematically immune to centroid drift — the original embeddings
+are never averaged. Two orthogonal embeddings fed alternately 20 times each will always
+remain in separate clusters.
+
+**Fix Part B — InsightFace probe (fallback to CLIP):**
+At first call, `_probe_embedding_source()` attempts `import insightface`. InsightFace
+is NOT installed in this deployment (`ModuleNotFoundError`). The fallback to CLIP is
+logged as a WARNING. The `distance_threshold` stays at 0.45 (tighter than the prior
+0.6 default) to reduce false cluster merges with CLIP's less-discriminative space.
+When InsightFace becomes available: `pip install insightface onnxruntime`
+
+**Fix Part C — Torso appearance-descriptor conflict check:**
+As defense-in-depth for the CLIP fallback case, `_torso_color_descriptor()` extracts
+an 8-bin HSV hue histogram from the torso region below the face box. If a face embedding
+would be assigned to cluster X, but the torso histogram diverges from cluster X's
+recorded appearance by more than `_APPEARANCE_CONFLICT_THRESHOLD = 0.40` (Bhattacharyya
+L1 distance), the match is rejected and a new cluster is created. This prevents cross-actor
+reassignment in scenes where the two actors wear clearly different clothing.
+
+**Regression tests:** `test_exemplar_gallery_rejects_identity_flip`,
+`test_three_distinct_embeddings_three_clusters`
+
+---
+
+### 21.4 Graphics/End-Card Two-Path Check + Schema Invariant
+
+**Part A — Why the Round 20 fix failed for the Netflix card:**
+The prior implementation of `is_graphics_or_endcard()` used a single-path check:
+`color_std < 18.0 AND edge_density < 0.015`. This catches flat grey cards (color_std ≈ 3).
+The Netflix 'N' card (dark red letter on black background) has `color_std ≈ 25` — above
+the 18.0 threshold — so the pre-check never fired. The card then fell through to
+`_heuristic_scene_label()` which returned "office" (warm/neutral interior default).
+
+**Fix — Two-path check:**
+- **Path 1** (unchanged): `color_std < 18.0 AND edge_density < 0.015` — flat grey cards
+- **Path 2** (new): `dark_fraction > 0.70 AND color_std < 30.0` — dark-bg colored logos
+  - `dark_fraction = fraction of pixels with gray < 15`
+  - Netflix 'N' card: dark_fraction ≈ 0.85, color_std ≈ 25 → Path 2 fires ✓
+  - Dark dramatic film scene: dark_fraction can be > 0.70, but real content gives
+    color_std > 30 from actor outlines and practical lights → Path 2 does NOT fire ✓
+
+**Pure black frame behaviour change (§21.4):**
+- **Before:** `image.max() < 5` early return → "unknown"
+- **After:** `dark_fraction = 1.0 > 0.70, color_std = 0 < 30` → "graphics/end card"
+- **Rationale:** A fade-to-black is not a real scene location. Labeling it "unknown"
+  was ambiguous; "graphics/end card" is semantically correct.
+- **Affected tests updated:** `test_label_scene_black_image_returns_endcard` (was
+  `test_label_scene_black_image_returns_unknown`), `test_scene_label_black_frame`
+  in `test_adapters.py`, `test_pure_black_frame_returns_endcard` (was `_not_endcard`).
+
+**Part B — Schema invariant for character_labels:**
+`pipeline.py._finalize_event()` now enforces:
+  - `character_data_available` guard: clustering is skipped entirely when the event
+    had no real image data (prevents carry-forward face embeddings from producing labels)
+  - Schema invariant: after all character work, if `max_characters_seen == 0 or None`
+    but `character_labels` is non-empty, the labels are cleared with a WARNING log.
+    This is the final safety net for Event 10's `["Person A"]` + `max_characters_seen: 0`.
+
+**Root cause of Event 10's stale label (traced):**
+The NetFlix card event had `character_data_available=True` (the event DID have real
+frames), `max_characters_seen=0` (face detector found zero faces in those frames),
+but face embeddings from a CLIP embedding of the card image produced a near-match to
+the existing "Person A" cluster, which assigned the label. The schema invariant catches
+this: any event where the face detector confirmed zero faces cannot have character labels.
+
+**Regression tests:** `test_netflix_style_dark_bg_logo_detected`,
+`test_legacy_flat_grey_card_still_detected`, `test_dark_film_scene_not_misclassified`,
+`test_schema_guard_clears_stale_labels`, `test_schema_guard_preserves_valid_labels`
