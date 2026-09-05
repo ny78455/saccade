@@ -41,6 +41,15 @@ logger = logging.getLogger(__name__)
 
 _MAX_HOLD_MS = 2000.0  # Non-functional requirement: max decision delay
 
+# Novelty-spike split trigger (Fix 2 — DECISIONS.md §21.2)
+# Fires when novelty jumps sharply within a long, already-open event.
+# Deliberately decoupled from the motion-based triggers:
+#   - slow reveals don't produce motion spikes, only novelty spikes
+#   - this is a semantically direct signal for "something new appeared in frame"
+NOVELTY_SPIKE_THRESHOLD = 0.35  # absolute floor: novelty must be at least this
+NOVELTY_SPIKE_RATIO = 2.5       # current must be >= 2.5x the 3-second baseline
+NOVELTY_SPIKE_MIN_DURATION_S = 15.0  # guard: only fire in long events
+
 # Action labels that constitute "fast action" for hard-trigger purposes.
 # Must match the buckets in adapters/action_stub.py.
 _ACTION_TRIGGER_LABELS: frozenset = frozenset({"fast_action"})
@@ -66,6 +75,11 @@ class CandidateDetector:
         self._hold_scores: List[float] = []
         self._hold_signals: List[BoundarySignal] = []
         self._hold_available: List[dict] = []  # availability dict per hold slot
+        # Novelty spike gate: count seconds since the last boundary commitment.
+        # Reset to 0 on every boundary (is_boundary=True return).
+        # Provides the event-duration proxy needed by check_novelty_spike()
+        # without requiring a reference to EventConstructor.
+        self._seconds_since_boundary: int = 0
 
     def update(
         self,
@@ -162,7 +176,34 @@ class CandidateDetector:
                 fused_score=fused,
             )
 
-        # --- Well above threshold — immediate high-confidence boundary ---
+        # HARD TRIGGER 3 — novelty-only spike inside a long event (Fix 2 — §21.2).
+        # Fires when novelty jumps sharply relative to the recent 3-second baseline,
+        # decoupled from motion. Catches slow, cut-free reveals that a motion-based
+        # trigger cannot see (a deliberate entrance with no fast movement).
+        # Gate: event must be > 15 s old (prevents it becoming a general-purpose
+        # high-frequency trigger on short events).
+        self._seconds_since_boundary += 1
+        if (
+            self._seconds_since_boundary > NOVELTY_SPIKE_MIN_DURATION_S
+            and self._check_novelty_spike(curr)
+        ):
+            self._clear_hold()  # resets _seconds_since_boundary to 0
+            logger.info(
+                "AESE HARD TRIGGER (novelty_spike) at ts=%.0f ms: "
+                "novelty=%.3f spiked above %.1f× baseline in a %.0fs event — "
+                "boundary committed at confidence=0.80",
+                curr_ts,
+                curr.novelty_score,
+                NOVELTY_SPIKE_RATIO,
+                self._seconds_since_boundary,
+            )
+            return BoundaryDecision(
+                is_boundary=True,
+                confidence=0.80,
+                dominant_signal="novelty_spike",
+                fused_score=fused,
+            )
+
         if fused >= threshold + margin:
             self._clear_hold()
             logger.debug(
@@ -301,9 +342,37 @@ class CandidateDetector:
         now_action = all(f.action_label in _ACTION_TRIGGER_LABELS for f in recent[-2:])
         return was_non_action and now_action
 
+    def _check_novelty_spike(self, curr: TemporalFeature) -> bool:
+        """
+        Return True if novelty jumps sharply above the recent baseline.
+
+        Logic:
+          - Compute the mean novelty of the 3 features BEFORE the current one
+            (baseline = what 'normal' looks like for this event)
+          - Fire if curr.novelty_score >= NOVELTY_SPIKE_THRESHOLD (absolute floor)
+            AND curr.novelty_score >= baseline * NOVELTY_SPIKE_RATIO (relative jump)
+
+        Requires at least 4 features in the buffer (3 for baseline + current).
+        Returns False if buffer is too small.
+
+        Why the RATIO guard matters: if baseline is already high (a busy, dynamic
+        event), a further jump should NOT fire — the ratio ensures only
+        stepwise changes trigger, not sustained high-novelty periods.
+        """
+        recent = self.buffer.recent(4)  # [t-3, t-2, t-1, curr]
+        if len(recent) < 4:
+            return False
+        baseline_features = recent[:-1]  # the 3 seconds before current
+        baseline = sum(f.novelty_score for f in baseline_features) / len(baseline_features)
+        return (
+            curr.novelty_score >= NOVELTY_SPIKE_THRESHOLD
+            and curr.novelty_score >= baseline * NOVELTY_SPIKE_RATIO
+        )
+
     def _clear_hold(self) -> None:
-        """Reset hold state."""
+        """Reset hold state and the event-duration counter."""
         self._hold_start_ms = None
         self._hold_scores = []
         self._hold_signals = []
         self._hold_available = []
+        self._seconds_since_boundary = 0
