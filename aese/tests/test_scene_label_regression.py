@@ -29,18 +29,27 @@ def test_label_scene_none_image_returns_unknown():
     assert result == "unknown", f"Expected 'unknown', got {result!r}"
 
 
-def test_label_scene_black_image_returns_unknown():
-    """A black frame (all zeros) must return 'unknown'."""
+def test_label_scene_black_image_returns_endcard():
+    """
+    A black frame (all zeros) must return 'graphics/end card' (§21.4).
+
+    Prior behaviour was 'unknown' (image.max() < 5 early return).
+    §21.4 changes this: a pure black frame has dark_fraction=1.0 and color_std=0,
+    which fires Path 2 of is_graphics_or_endcard(), correctly classifying a
+    fade-to-black as a graphics card rather than a real scene location.
+    """
     black = np.zeros((64, 64, 3), dtype=np.uint8)
     result = label_scene(black)
-    assert result == "unknown", f"Expected 'unknown' for black frame, got {result!r}"
+    assert result == "graphics/end card", (
+        f"Expected 'graphics/end card' for pure black frame (§21.4), got {result!r}"
+    )
 
 
 def test_label_scene_always_returns_str():
     """label_scene() must always return a non-None str in all code paths."""
     test_images = [
         None,
-        np.zeros((64, 64, 3), dtype=np.uint8),                         # black
+        np.zeros((64, 64, 3), dtype=np.uint8),                         # black -> "graphics/end card" (§21.4)
         np.full((64, 64, 3), 128, dtype=np.uint8),                     # mid-grey
         np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8),        # noise
     ]

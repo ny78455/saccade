@@ -100,7 +100,13 @@ def _finalize_event(
     event.event_id = next_id
 
     # --- Character clustering ---
-    if clusterer is not None and event_features_map is not None:
+    # Guard: only run clustering when the event had real image data.
+    # character_data_available=False means EVERY second in this event had
+    # no real pixel data (manifest-replay mode or video-less run).
+    # Skipping clustering on such events prevents stale face embeddings
+    # from carry-forward features producing phantom character labels.
+    if clusterer is not None and event_features_map is not None \
+            and event.character_data_available:
         feats = event_features_map.get(event.event_id, [])
         face_embeddings_per_second = [getattr(tf, "face_embeddings", []) for tf in feats]
         event.character_labels = get_character_labels_for_event(face_embeddings_per_second, clusterer)
@@ -170,6 +176,26 @@ def _finalize_event(
                 caption_estimate, current, event.event_id,
             )
             event.max_characters_seen = caption_estimate
+
+    # --- Schema invariant: character_labels must be empty when no characters seen ---
+    # character_labels can become non-empty when:
+    #   (a) face embeddings arrive from carry-forward features (image from previous event)
+    #   (b) the event_features_map lookup resolves to a stale embedding set
+    # The character_data_available guard (above) prevents case (a) but cannot
+    # prevent all cases. This is the final safety net.
+    #
+    # Why both are needed:
+    #   character_data_available=True but max_characters_seen=0 means the event
+    #   HAD real images, but the face detector found zero faces in all of them.
+    #   In that case, any non-empty character_labels is a clustering artefact.
+    if (event.max_characters_seen is None or event.max_characters_seen == 0) \
+            and event.character_labels:
+        logger.warning(
+            "AESE: schema invariant violated for event %d — "
+            "character_labels=%s but max_characters_seen=%s. Clearing stale labels.",
+            event.event_id, event.character_labels, event.max_characters_seen,
+        )
+        event.character_labels = []
 
 
 def run(

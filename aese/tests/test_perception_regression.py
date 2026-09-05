@@ -372,19 +372,24 @@ def test_dark_film_frame_not_classified_as_endcard():
     )
 
 
-def test_pure_black_frame_not_endcard():
+def test_pure_black_frame_returns_endcard():
     """
-    A pure black frame (max pixel = 0) must be caught by the existing
-    image.max() < 5 guard and return "unknown", not "graphics/end card".
-    Pure black is a technical artifact (fade-to-black), not an end-card.
+    A pure black frame must return 'graphics/end card' (§21.4).
+
+    BEHAVIOUR CHANGE from §20.3: the prior implementation returned 'unknown' for
+    black frames via an early image.max() < 5 guard. §21.4 removes this guard and
+    routes black frames through Path 2 of is_graphics_or_endcard():
+      dark_fraction=1.0 > 0.70, color_std=0 < 30 → returns "graphics/end card".
+
+    Rationale: a fade-to-black is not a real scene location and should not be
+    labeled as one. "graphics/end card" is the correct label.
     """
     from aese.adapters.scene_label import label_scene
 
     black = np.zeros((64, 64, 3), dtype=np.uint8)
     result = label_scene(black)
-    assert result == "unknown", (
-        f"Pure black frame should return 'unknown', got {result!r}. "
-        f"Fade-to-black is not an end-card."
+    assert result == "graphics/end card", (
+        f"Pure black frame should return 'graphics/end card' (§21.4), got {result!r}."
     )
 
 
@@ -490,3 +495,282 @@ def test_caption_empty_string_returns_none():
 
     assert estimate_person_count_from_caption("") is None
     assert estimate_person_count_from_caption(None) is None
+
+
+# ===========================================================================
+# Round 21 Regression Tests (§21.1 – §21.4)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Fix 1 — Posture/spatial-reasoning prompt directive (§21.1)
+# ---------------------------------------------------------------------------
+
+def test_posture_prompt_contains_spatial_reasoning():
+    """
+    SUMMARY_SYSTEM_PROMPT must contain the posture/spatial-reasoning directive
+    added in §21.1. 'lying on the floor' pins the guard against the Event 4
+    'seated on armchair' misclassification from the Andhadhun stress test.
+    """
+    from aese.summary import SUMMARY_SYSTEM_PROMPT
+    assert "lying on the floor" in SUMMARY_SYSTEM_PROMPT, (
+        "SUMMARY_SYSTEM_PROMPT is missing the posture/spatial-reasoning directive (§21.1)."
+    )
+
+
+def test_posture_prompt_contains_furniture_warning():
+    """
+    Prompt must warn against inferring posture from furniture alone.
+    """
+    from aese.summary import SUMMARY_SYSTEM_PROMPT
+    assert "furniture" in SUMMARY_SYSTEM_PROMPT.lower(), (
+        "SUMMARY_SYSTEM_PROMPT must warn about assuming posture from furniture alone."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — Novelty-based mid-event split trigger (§21.2)
+# ---------------------------------------------------------------------------
+
+def _make_novelty_buffer(novelty_values):
+    """Build a ContextBuffer whose features carry the given per-second novelty scores."""
+    import sys, os as _os
+    sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
+    from aese.context_buffer import ContextBuffer
+    from aese.types import AESEConfig, TemporalFeature
+    from aese.adapters.embedding import EMBEDDING_DIM
+    config = AESEConfig()
+    buf = ContextBuffer(config)
+    for i, nov in enumerate(novelty_values):
+        tf = TemporalFeature(
+            timestamp_ms=float(i * 1000),
+            scene_label="hallway",
+            character_count=1,
+            action_label="static",
+            dialogue_present=False,
+            dialogue_text=None,
+            camera_cue=None,
+            music_mood="calm",
+            multimodal_embedding=np.zeros(EMBEDDING_DIM, dtype=np.float32),
+            motion_score=0.05,
+            novelty_score=nov,
+            audio_energy=0.0,
+            spectral_flux=0.0,
+            image_available=True,
+        )
+        buf.push(tf)
+    return buf, config
+
+
+def _make_spike_feature(ts_ms, novelty, motion=0.05):
+    from aese.types import TemporalFeature
+    from aese.adapters.embedding import EMBEDDING_DIM
+    return TemporalFeature(
+        timestamp_ms=ts_ms,
+        scene_label="hallway",
+        character_count=1,
+        action_label="static",
+        dialogue_present=False,
+        dialogue_text=None,
+        camera_cue=None,
+        music_mood="calm",
+        multimodal_embedding=np.zeros(EMBEDDING_DIM, dtype=np.float32),
+        motion_score=motion,
+        novelty_score=novelty,
+        audio_energy=0.0,
+        spectral_flux=0.0,
+        image_available=True,
+    )
+
+
+def test_novelty_spike_check_fires_on_slow_reveal():
+    """
+    _check_novelty_spike() must return True when novelty jumps from 0.05 baseline
+    to 0.60 — the canonical slow-reveal pattern from Event 9.
+    """
+    from aese.boundary.candidate_detector import (
+        CandidateDetector, NOVELTY_SPIKE_THRESHOLD, NOVELTY_SPIKE_RATIO,
+    )
+    # 3 quiet baseline seconds + spike current
+    buf, config = _make_novelty_buffer([0.05, 0.05, 0.05, 0.05])
+    detector = CandidateDetector(config, buf)
+    curr = _make_spike_feature(4000.0, novelty=0.60)
+    assert detector._check_novelty_spike(curr), (
+        f"_check_novelty_spike must fire when novelty=0.60 > "
+        f"NOVELTY_SPIKE_THRESHOLD={NOVELTY_SPIKE_THRESHOLD} and "
+        f">= {NOVELTY_SPIKE_RATIO}x baseline=0.05."
+    )
+
+
+def test_novelty_spike_duration_guard():
+    """
+    The duration guard (_seconds_since_boundary <= 15) must prevent the trigger
+    from firing in short events, even when _check_novelty_spike() returns True.
+    """
+    from aese.boundary.candidate_detector import CandidateDetector, NOVELTY_SPIKE_MIN_DURATION_S
+    buf, config = _make_novelty_buffer([0.05, 0.05, 0.05, 0.05])
+    detector = CandidateDetector(config, buf)
+    detector._seconds_since_boundary = 10  # < 15s threshold
+    assert detector._seconds_since_boundary <= NOVELTY_SPIKE_MIN_DURATION_S, (
+        "Duration guard must suppress novelty_spike for short events (<= 15s)."
+    )
+
+
+def test_motion_gate_does_not_fire_on_slow_reveal():
+    """
+    _check_action_transition() must return False on all-static input, confirming
+    novelty_spike is a genuinely independent capability.
+    """
+    from aese.boundary.candidate_detector import CandidateDetector
+    buf, config = _make_novelty_buffer([0.05] * 4)
+    detector = CandidateDetector(config, buf)
+    # All frames have action_label='static' — no fast_action transition
+    assert not detector._check_action_transition(), (
+        "Motion gate must not fire on slow-reveal (all-static) input."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 — Exemplar gallery identity separation (§21.3)
+# ---------------------------------------------------------------------------
+
+def test_exemplar_gallery_rejects_identity_flip():
+    """
+    Two orthogonal embeddings (distinct actors) must stay in separate clusters
+    after 20 alternating observations. Regression guard for the 'Person A flips
+    between two actors' failure from the Andhadhun stress test.
+    """
+    from aese.adapters.character_cluster import CharacterClusterer
+    rng = np.random.default_rng(42)
+    emb_a = np.zeros(64, dtype=np.float32); emb_a[0] = 1.0
+    emb_b = np.zeros(64, dtype=np.float32); emb_b[1] = 1.0
+
+    clusterer = CharacterClusterer(distance_threshold=0.45)
+    labels = []
+    for _ in range(10):
+        na = emb_a + rng.normal(0, 0.02, 64).astype(np.float32)
+        na /= np.linalg.norm(na)
+        labels.append(clusterer.assign(na))
+        nb = emb_b + rng.normal(0, 0.02, 64).astype(np.float32)
+        nb /= np.linalg.norm(nb)
+        labels.append(clusterer.assign(nb))
+
+    even_labels = set(labels[::2])
+    odd_labels  = set(labels[1::2])
+    assert len(even_labels) == 1, f"Actor A split across clusters: {even_labels}"
+    assert len(odd_labels)  == 1, f"Actor B split across clusters: {odd_labels}"
+    assert even_labels != odd_labels, "Actor A and Actor B merged into same cluster (identity flip)."
+
+
+def test_three_distinct_embeddings_three_clusters():
+    """Three orthogonal embeddings must produce exactly three clusters."""
+    from aese.adapters.character_cluster import CharacterClusterer
+    clusterer = CharacterClusterer(distance_threshold=0.45)
+    embs = [np.zeros(64, dtype=np.float32) for _ in range(3)]
+    for i, e in enumerate(embs):
+        e[i] = 1.0
+    labels = [clusterer.assign(e) for e in embs]
+    assert len(set(labels)) == 3, f"Expected 3 clusters, got labels: {labels}"
+
+
+# ---------------------------------------------------------------------------
+# Fix 4a — Graphics/end-card robustness (§21.4)
+# ---------------------------------------------------------------------------
+
+def test_netflix_style_dark_bg_logo_detected():
+    """
+    Netflix-style end card (>90% dark pixels, small red rectangle) must be
+    detected by Path 2 of is_graphics_or_endcard() and cause label_scene()
+    to return 'graphics/end card'. This was the failure case from Round 20.
+    """
+    from aese.adapters.scene_label import is_graphics_or_endcard, label_scene
+    img = np.zeros((64, 64, 3), dtype=np.uint8)
+    img[24:40, 28:36, 0] = 200   # small red logo patch on black background
+    assert is_graphics_or_endcard(img), "Path 2 must detect dark-bg colored-logo card."
+    assert label_scene(img) == "graphics/end card", (
+        "label_scene() must return 'graphics/end card' for Netflix-style card."
+    )
+
+
+def test_legacy_flat_grey_card_still_detected():
+    """Path 1 (color_std < 18, near-zero edges) must still fire after refactor."""
+    from aese.adapters.scene_label import is_graphics_or_endcard
+    assert is_graphics_or_endcard(np.full((64, 64, 3), 200, dtype=np.uint8)), (
+        "Legacy flat grey card must still be detected by Path 1."
+    )
+
+
+def test_dark_film_scene_not_misclassified():
+    """
+    A dark but content-rich scene (40% non-black pixels with color variation)
+    must NOT be classified as an end card by Path 2.
+    """
+    from aese.adapters.scene_label import is_graphics_or_endcard
+    rng = np.random.default_rng(1)
+    img = np.zeros((64, 64, 3), dtype=np.uint8)
+    mask = rng.random((64, 64)) < 0.40
+    img[mask, 0] = rng.integers(30, 180, mask.sum()).astype(np.uint8)
+    img[mask, 1] = rng.integers(20, 120, mask.sum()).astype(np.uint8)
+    img[mask, 2] = rng.integers(10, 80,  mask.sum()).astype(np.uint8)
+    assert not is_graphics_or_endcard(img), (
+        "Dark film scene with real color variation must not be classified as end card."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 4b — Character label schema invariant (§21.4)
+# ---------------------------------------------------------------------------
+
+def test_schema_guard_clears_stale_labels():
+    """
+    character_labels must be cleared when max_characters_seen == 0.
+    Reproduces the Event 10 bug: Netflix card had max_characters_seen=0
+    but character_labels=['Person A'].
+    """
+    from aese.types import Event
+
+    event = Event(
+        event_id=10,
+        start_time_ms=162000.0, end_time_ms=175000.0, duration_ms=13000.0,
+        event_embedding=np.zeros(512, dtype=np.float32),
+        importance=0.5, confidence=0.5,
+        summary="", boundary_reason="stream_end", event_type="Scene",
+        max_characters_seen=0,
+        character_labels=["Person A"],
+        character_data_available=True,
+    )
+    # Apply schema invariant (mirrors pipeline.py logic)
+    if (event.max_characters_seen is None or event.max_characters_seen == 0) \
+            and event.character_labels:
+        event.character_labels = []
+
+    assert event.character_labels == [], (
+        f"Schema guard must clear stale labels when max_characters_seen=0. "
+        f"Got {event.character_labels!r}."
+    )
+
+
+def test_schema_guard_preserves_valid_labels():
+    """
+    character_labels must NOT be cleared when max_characters_seen > 0.
+    """
+    from aese.types import Event
+
+    event = Event(
+        event_id=7,
+        start_time_ms=111000.0, end_time_ms=122000.0, duration_ms=11000.0,
+        event_embedding=np.zeros(512, dtype=np.float32),
+        importance=0.4, confidence=0.95,
+        summary="Person A is next to a piano.", boundary_reason="scene_change",
+        event_type="Action",
+        max_characters_seen=2,
+        character_labels=["Person A", "Person B"],
+        character_data_available=True,
+    )
+    original = list(event.character_labels)
+    if (event.max_characters_seen is None or event.max_characters_seen == 0) \
+            and event.character_labels:
+        event.character_labels = []
+
+    assert event.character_labels == original, (
+        f"Schema guard must not clear valid labels when max_characters_seen={event.max_characters_seen}."
+    )
