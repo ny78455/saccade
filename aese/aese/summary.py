@@ -70,6 +70,13 @@ SUMMARY_SYSTEM_PROMPT = (
     "unexpected, or anomalous -- items on the floor, unusual body positions, weapons, "
     "spills, or anyone not clearly participating in an ordinary activity. "
     "If you are not confident about a detail, do not state it as fact. "
+    "POSTURE AND SPATIAL REASONING: Pay close attention to body orientation and "
+    "position, not just nearby furniture. Do not assume a person is sitting or "
+    "standing simply because furniture (a chair, sofa, or bed) is visible in the "
+    "frame. If a body or limbs are aligned horizontally along the floor plane, or "
+    "a person appears motionless and prone, state explicitly that a person is "
+    "lying on the floor -- do not default to 'seated' or 'standing' based on "
+    "nearby objects alone. "
     "Do not include greetings, offers of further help, meta-commentary, or markdown."
 )
 
