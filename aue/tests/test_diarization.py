@@ -61,10 +61,12 @@ class TestSpeakerClusterer:
             labels_a.add(self.clusterer.assign(emb_a.copy()))
             labels_b.add(self.clusterer.assign(emb_b.copy()))
 
-        assert labels_a == labels_b == {labels_a.pop()}, False  # not this
-        # They should be different labels
-        label_a = self.clusterer.assign(emb_a.copy())
-        label_b = self.clusterer.assign(emb_b.copy())
+        # Each speaker must consistently map to exactly one cluster label
+        assert len(labels_a) == 1, f"Speaker A mapped to multiple labels: {labels_a}"
+        assert len(labels_b) == 1, f"Speaker B mapped to multiple labels: {labels_b}"
+        # And the two speakers must have different labels
+        label_a = labels_a.pop()
+        label_b = labels_b.pop()
         assert label_a != label_b, (
             f"Both speakers got label {label_a!r} — identity flip! "
             "Exemplar gallery should prevent this."
