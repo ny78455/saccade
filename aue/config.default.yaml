@@ -1,0 +1,35 @@
+# AUE config.default.yaml
+# All values correspond to AUEConfig dataclass fields.
+# Override by passing --config /path/to/custom.yaml to cli.py.
+
+rolling_buffer_seconds: 20.0
+vad_speech_threshold: 0.5
+
+# Whisper model size: base | small | medium | large-v3
+# "small" chosen: ~4x faster than "medium" on CPU, WER tradeoff documented
+# in DECISIONS.md §AUE-2. Use "medium" for higher-accuracy offline runs.
+whisper_model_size: "small"
+
+# Speaker clustering threshold (L2 distance).
+# 0.45 mirrors CharacterClusterer.DISTANCE_THRESHOLD_CLIP in AESE §21.3.
+speaker_cluster_threshold: 0.45
+
+sound_event_confidence_threshold: 0.5
+music_detection_threshold: 0.5
+music_window_seconds: 2.0
+sed_window_seconds: 1.0
+
+# panns_checkpoint_dir: null  # null => default ~/.panns_data/
+
+# RTF warning threshold (real-time factor).
+# Pipeline logs WARNING if total_processing_time / audio_duration >= 1.0.
+rtf_warn_threshold: 1.0
+
+# Importance weights — must sum to exactly 1.0.
+# Acceptance test runs at import time in types.py.
+importance_weights:
+  speech: 0.30
+  music: 0.20
+  sound_event: 0.20
+  dialogue_semantic: 0.15
+  context: 0.15
